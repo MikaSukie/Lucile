@@ -201,6 +201,8 @@ typedef struct Type {
         } ptr;
         struct {
             const char *name;
+            struct Type **generic_args;
+            int generic_arg_count;
         } named;
         struct {
             const char *param;
@@ -1425,6 +1427,63 @@ Type *resolve_float_type(void) {
     return _f64;
 }
 
+static Type *copy_type_with_subst(Type *t, const char **params, Type **actuals,
+                                  int count, Arena *a) {
+    if (!t) return NULL;
+    if (t->kind == TY_GENERIC && t->generic.param && params) {
+        for (int i = 0; i < count; i++) {
+            if (params[i] && strcmp(params[i], t->generic.param) == 0)
+                return actuals ? actuals[i] : t;
+        }
+    }
+    Type *n = make_type(a, t->kind);
+    switch (t->kind) {
+        case TY_ARRAY:
+            n->array.count = t->array.count;
+            n->array.elem = copy_type_with_subst(t->array.elem, params, actuals, count, a);
+            break;
+        case TY_PTR:
+            n->ptr.pointee = copy_type_with_subst(t->ptr.pointee, params, actuals, count, a);
+            break;
+        case TY_STRUCT:
+        case TY_ENUM:
+            n->named.name = t->named.name;
+            if (t->named.generic_arg_count > 0) {
+                n->named.generic_arg_count = t->named.generic_arg_count;
+                n->named.generic_args = arena_alloc(a, sizeof(Type *) * (size_t)t->named.generic_arg_count);
+                for (int i = 0; i < t->named.generic_arg_count; i++)
+                    n->named.generic_args[i] = copy_type_with_subst(t->named.generic_args[i], params, actuals, count, a);
+            }
+            break;
+        case TY_FUNC:
+            n->func.param_count = t->func.param_count;
+            n->func.variadic = t->func.variadic;
+            if (t->func.param_count > 0) {
+                n->func.params = arena_alloc(a, sizeof(Type *) * (size_t)t->func.param_count);
+                for (int i = 0; i < t->func.param_count; i++)
+                    n->func.params[i] = copy_type_with_subst(t->func.params[i], params, actuals, count, a);
+            }
+            n->func.ret = copy_type_with_subst(t->func.ret, params, actuals, count, a);
+            break;
+        case TY_GENERIC:
+            n->generic.param = t->generic.param;
+            break;
+        default:
+            *n = *t;
+            break;
+    }
+    return n;
+}
+
+static bool type_named_args_equal(Type *a, Type *b) {
+    if (a->named.generic_arg_count != b->named.generic_arg_count) return false;
+    for (int i = 0; i < a->named.generic_arg_count; i++) {
+        if (!types_equal(a->named.generic_args[i], b->named.generic_args[i]))
+            return false;
+    }
+    return true;
+}
+
 bool type_is_integer(Type *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -1476,7 +1535,8 @@ bool types_equal(Type *a, Type *b) {
             return types_equal(a->ptr.pointee, b->ptr.pointee);
         case TY_STRUCT:
         case TY_ENUM:
-            return strcmp(a->named.name, b->named.name) == 0;
+            if (strcmp(a->named.name, b->named.name) != 0) return false;
+            return type_named_args_equal(a, b);
         case TY_GENERIC:
             return strcmp(a->generic.param, b->generic.param) == 0;
         default:
@@ -1739,11 +1799,23 @@ static Type *parse_type(Parser *p) {
 
             if (check(p, TOK_LANGLE)) {
                 advance_tok(p);
-
-                parse_type(p);
-
-                while (match_tok(p, TOK_COMMA)) parse_type(p);
+                int ac = 0, acap = 0;
+                Type **args = NULL;
+                while (!check(p, TOK_RANGLE) && !check(p, TOK_EOF)) {
+                    Type *arg = parse_type(p);
+                    if (ac >= acap) {
+                        int nc = acap == 0 ? 4 : acap * 2;
+                        Type **na = arena_alloc(a, sizeof(Type *) * (size_t)nc);
+                        if (args) memcpy(na, args, sizeof(Type *) * (size_t)ac);
+                        args = na;
+                        acap = nc;
+                    }
+                    args[ac++] = arg;
+                    if (!match_tok(p, TOK_COMMA)) break;
+                }
                 expect(p, TOK_RANGLE, ">");
+                t->named.generic_args = args;
+                t->named.generic_arg_count = ac;
             }
             break;
         }
@@ -4572,10 +4644,18 @@ static bool sem_types_compatible(Type *src, Type *dst) {
                sem_types_compatible(src->array.elem, dst->array.elem);
     }
 
-    if (src->kind == TY_STRUCT && dst->kind == TY_STRUCT)
-        return strcmp(src->named.name, dst->named.name) == 0;
-    if (src->kind == TY_ENUM && dst->kind == TY_ENUM)
-        return strcmp(src->named.name, dst->named.name) == 0;
+    if ((src->kind == TY_STRUCT || src->kind == TY_ENUM) &&
+        (dst->kind == TY_STRUCT || dst->kind == TY_ENUM)) {
+        if (strcmp(src->named.name, dst->named.name) != 0) return false;
+        if (src->named.generic_arg_count != dst->named.generic_arg_count)
+            return false;
+        for (int i = 0; i < src->named.generic_arg_count; i++) {
+            if (!sem_types_compatible(src->named.generic_args[i],
+                                      dst->named.generic_args[i]))
+                return false;
+        }
+        return true;
+    }
 
     if (src->kind == TY_FUNC && dst->kind == TY_FUNC) return true;
     return false;
@@ -4614,8 +4694,6 @@ static Type *sem_array_literal_type(SemCtx *sc, ASTNode *n) {
 
 static bool sem_typeswitch_is_exhaustive(Type *subject_ty, ASTNode *n) {
     if (!n || !subject_ty) return true;
-    if (subject_ty->kind == TY_GENERIC || subject_ty->kind == TY_CONTEXT)
-        return true;
     if (n->typeswitch.fallback) return true;
 
     for (int i = 0; i < n->typeswitch.case_count; i++) {
@@ -4627,37 +4705,66 @@ static bool sem_typeswitch_is_exhaustive(Type *subject_ty, ASTNode *n) {
             mt = resolve_float_type();
         if (types_equal(mt, subject_ty)) return true;
     }
+
+    return (subject_ty->kind == TY_GENERIC || subject_ty->kind == TY_CONTEXT)
+               ? true
+               : false;
+}
+
+static bool sem_name_is_one_of(const char *name, const char **names,
+                               int count) {
+    if (!name || !names) return false;
+    for (int i = 0; i < count; i++)
+        if (names[i] && strcmp(name, names[i]) == 0) return true;
     return false;
 }
 
-static Type *sem_normalize_generic_type(Type *ty, const char *generic_name) {
-    if (!ty || !generic_name) return ty;
+static Type *sem_normalize_type_params(Type *ty, const char **generic_names,
+                                       int generic_count) {
+    if (!ty || !generic_names || generic_count <= 0) return ty;
     switch (ty->kind) {
         case TY_STRUCT:
         case TY_ENUM:
-            if (strcmp(ty->named.name, generic_name) == 0) {
+            if (sem_name_is_one_of(ty->named.name, generic_names, generic_count)) {
                 ty->kind = TY_GENERIC;
-                ty->generic.param = generic_name;
+                ty->generic.param = ty->named.name;
+                return ty;
             }
+            for (int i = 0; i < ty->named.generic_arg_count; i++)
+                ty->named.generic_args[i] = sem_normalize_type_params(
+                    ty->named.generic_args[i], generic_names, generic_count);
             return ty;
         case TY_ARRAY:
             ty->array.elem =
-                sem_normalize_generic_type(ty->array.elem, generic_name);
+                sem_normalize_type_params(ty->array.elem, generic_names,
+                                          generic_count);
             return ty;
         case TY_PTR:
             ty->ptr.pointee =
-                sem_normalize_generic_type(ty->ptr.pointee, generic_name);
+                sem_normalize_type_params(ty->ptr.pointee, generic_names,
+                                          generic_count);
             return ty;
         case TY_FUNC:
             for (int i = 0; i < ty->func.param_count; i++)
-                ty->func.params[i] = sem_normalize_generic_type(
-                    ty->func.params[i], generic_name);
-            ty->func.ret =
-                sem_normalize_generic_type(ty->func.ret, generic_name);
+                ty->func.params[i] = sem_normalize_type_params(
+                    ty->func.params[i], generic_names, generic_count);
+            ty->func.ret = sem_normalize_type_params(ty->func.ret, generic_names,
+                                                     generic_count);
             return ty;
         default:
             return ty;
     }
+}
+
+static Type *sem_normalize_generic_type(Type *ty, const char *generic_name) {
+    if (!generic_name) return ty;
+    const char *names[1] = {generic_name};
+    return sem_normalize_type_params(ty, names, 1);
+}
+
+static bool sem_named_type_known(SemCtx *sc, const char *name) {
+    return name && (sem_find_struct(sc->program, name) != NULL ||
+                    sem_find_enum(sc->program, name) != NULL);
 }
 
 static bool sem_type_known(SemCtx *sc, Type *ty, const char *generic_name) {
@@ -4687,13 +4794,14 @@ static bool sem_type_known(SemCtx *sc, Type *ty, const char *generic_name) {
         case TY_PTR:
             return sem_type_known(sc, ty->ptr.pointee, generic_name);
         case TY_STRUCT:
-            if (generic_name && strcmp(ty->named.name, generic_name) == 0)
-                return true;
-            return sem_find_struct(sc->program, ty->named.name) != NULL;
         case TY_ENUM:
             if (generic_name && strcmp(ty->named.name, generic_name) == 0)
                 return true;
-            return sem_find_enum(sc->program, ty->named.name) != NULL;
+            if (!sem_named_type_known(sc, ty->named.name)) return false;
+            for (int i = 0; i < ty->named.generic_arg_count; i++)
+                if (!sem_type_known(sc, ty->named.generic_args[i], generic_name))
+                    return false;
+            return true;
         case TY_FUNC:
             for (int i = 0; i < ty->func.param_count; i++)
                 if (!sem_type_known(sc, ty->func.params[i], generic_name))
@@ -4753,8 +4861,83 @@ static Type *sem_enum_variant_type(SemCtx *sc, const char *enum_name,
     return NULL;
 }
 
+static Type *sem_copy_type_with_subst(SemCtx *sc, Type *t, const char **params,
+                                      Type **actuals, int count) {
+    if (!t) return NULL;
+    if (t->kind == TY_GENERIC && t->generic.param && params) {
+        for (int i = 0; i < count; i++) {
+            if (params[i] && strcmp(params[i], t->generic.param) == 0)
+                return actuals ? actuals[i] : t;
+        }
+    }
+    Type *n = make_type(sc->arena, t->kind);
+    switch (t->kind) {
+        case TY_ARRAY:
+            n->array.count = t->array.count;
+            n->array.elem = sem_copy_type_with_subst(sc, t->array.elem,
+                                                     params, actuals, count);
+            break;
+        case TY_PTR:
+            n->ptr.pointee = sem_copy_type_with_subst(sc, t->ptr.pointee,
+                                                      params, actuals, count);
+            break;
+        case TY_STRUCT:
+        case TY_ENUM:
+            n->named.name = t->named.name;
+            if (t->named.generic_arg_count > 0) {
+                n->named.generic_arg_count = t->named.generic_arg_count;
+                n->named.generic_args = arena_alloc(
+                    sc->arena, sizeof(Type *) * (size_t)t->named.generic_arg_count);
+                for (int i = 0; i < t->named.generic_arg_count; i++)
+                    n->named.generic_args[i] = sem_copy_type_with_subst(
+                        sc, t->named.generic_args[i], params, actuals, count);
+            }
+            break;
+        case TY_FUNC:
+            n->func.param_count = t->func.param_count;
+            n->func.variadic = t->func.variadic;
+            if (t->func.param_count > 0) {
+                n->func.params = arena_alloc(
+                    sc->arena, sizeof(Type *) * (size_t)t->func.param_count);
+                for (int i = 0; i < t->func.param_count; i++)
+                    n->func.params[i] = sem_copy_type_with_subst(
+                        sc, t->func.params[i], params, actuals, count);
+            }
+            n->func.ret = sem_copy_type_with_subst(sc, t->func.ret,
+                                                   params, actuals, count);
+            break;
+        case TY_GENERIC:
+            n->generic.param = t->generic.param;
+            break;
+        default:
+            *n = *t;
+            break;
+    }
+    return n;
+}
+
+static Type *sem_resolve_named_payload_type(SemCtx *sc, Type *enum_ty,
+                                            ASTNode *ed, int variant_index) {
+    if (!ed || variant_index < 0 || variant_index >= ed->enm.variant_count)
+        return NULL;
+    Type *payload = ed->enm.variant_types[variant_index];
+    if (!payload) return NULL;
+    if (!enum_ty || enum_ty->kind != TY_ENUM) return payload;
+    if (enum_ty->named.generic_arg_count == 0) return payload;
+    if (enum_ty->named.generic_arg_count == 1 && payload->kind == TY_GENERIC)
+        return enum_ty->named.generic_args[0];
+    if (ed->enm.generic_param_count > 0 &&
+        enum_ty->named.generic_arg_count >= ed->enm.generic_param_count) {
+        return sem_copy_type_with_subst(sc, payload, ed->enm.generic_params,
+                                        enum_ty->named.generic_args,
+                                        ed->enm.generic_param_count);
+    }
+    return payload;
+}
+
 static Type *sem_infer_expr(SemCtx *sc, ASTNode *n);
 static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n);
+static void sem_check_stmt_impl(SemCtx *sc, ASTNode *n);
 static void sem_check_stmt(SemCtx *sc, ASTNode *n);
 
 static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n) {
@@ -5013,6 +5196,17 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
             int vidx = -1;
             ty = make_type(sc->arena, TY_ENUM);
             ty->named.name = n->enum_field.enum_name;
+            if (n->ty && n->ty->named.name &&
+                strcmp(n->ty->named.name, n->enum_field.enum_name) == 0 &&
+                (n->ty->kind == TY_ENUM || n->ty->kind == TY_STRUCT)) {
+                ty->named.generic_arg_count = n->ty->named.generic_arg_count;
+                if (n->ty->named.generic_arg_count > 0) {
+                    ty->named.generic_args =
+                        arena_alloc(sc->arena, sizeof(Type *) * (size_t)n->ty->named.generic_arg_count);
+                    for (int i = 0; i < n->ty->named.generic_arg_count; i++)
+                        ty->named.generic_args[i] = n->ty->named.generic_args[i];
+                }
+            }
             Type *payload =
                 sem_enum_variant_type(sc, n->enum_field.enum_name,
                                       n->enum_field.variant, &vidx, n->line);
@@ -5163,7 +5357,7 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
     return ty;
 }
 
-static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
+static void sem_check_stmt_impl(SemCtx *sc, ASTNode *n) {
     if (!n) return;
     const char *saved_source_path = sc->source_path;
     if (n->source_path) diag_use_source_path(n->source_path);
@@ -5171,12 +5365,16 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
         case ND_BLOCK:
             sem_push(sc);
             for (int i = 0; i < n->block.count; i++)
-                sem_check_stmt(sc, n->block.stmts[i]);
+                sem_check_stmt_impl(sc, n->block.stmts[i]);
             sem_pop(sc);
             break;
         case ND_VAR_DECL: {
             Type *ty = n->var.type;
-            if (n->var.init && n->var.init->kind == ND_CALL && ty)
+            if (n->var.init && ty &&
+                (n->var.init->kind == ND_CALL ||
+                 n->var.init->kind == ND_ENUM_FIELD ||
+                 n->var.init->kind == ND_STRUCT_INIT ||
+                 n->var.init->kind == ND_ARRAY_LIT))
                 n->var.init->ty = ty;
             if (!ty && n->var.init) ty = sem_infer_expr(sc, n->var.init);
             if (!ty) ty = make_type(sc->arena, TY_VOID);
@@ -5217,7 +5415,11 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                 break;
             }
             Type *lt = sem_infer_lvalue(sc, n->assign.lhs);
-            if (n->assign.rhs && n->assign.rhs->kind == ND_CALL && lt &&
+            if (n->assign.rhs && lt &&
+                (n->assign.rhs->kind == ND_CALL ||
+                 n->assign.rhs->kind == ND_ENUM_FIELD ||
+                 n->assign.rhs->kind == ND_STRUCT_INIT ||
+                 n->assign.rhs->kind == ND_ARRAY_LIT) &&
                 (!n->assign.rhs->ty || n->assign.rhs->ty->kind == TY_CONTEXT))
                 n->assign.rhs->ty = lt;
             (void)sem_infer_expr(sc, n);
@@ -5226,7 +5428,11 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
         case ND_RETURN: {
             Type *expected =
                 sc->cur_ret ? sc->cur_ret : make_type(sc->arena, TY_VOID);
-            if (n->ret.val && n->ret.val->kind == ND_CALL)
+            if (n->ret.val &&
+                (n->ret.val->kind == ND_CALL ||
+                 n->ret.val->kind == ND_ENUM_FIELD ||
+                 n->ret.val->kind == ND_STRUCT_INIT ||
+                 n->ret.val->kind == ND_ARRAY_LIT))
                 n->ret.val->ty = expected;
             if (n->ret.val) {
                 Type *rt = sem_infer_expr(sc, n->ret.val);
@@ -5267,14 +5473,19 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                 if (arm->match_arm.bind_name) {
                     Type *bt = make_type(sc->arena, TY_VOID);
                     if (n->match.subject && n->match.subject->ty &&
-                        n->match.subject->ty->kind == TY_ENUM) {
+                        (n->match.subject->ty->kind == TY_ENUM ||
+                         n->match.subject->ty->kind == TY_STRUCT)) {
                         ASTNode *ed = sem_find_enum(
                             sc->program, n->match.subject->ty->named.name);
                         if (ed) {
                             for (int j = 0; j < ed->enm.variant_count; j++) {
                                 if (strcmp(ed->enm.variant_names[j],
                                            arm->match_arm.variant) == 0) {
-                                    if (ed->enm.variant_types[j])
+                                    Type *resolved = sem_resolve_named_payload_type(
+                                        sc, n->match.subject->ty, ed, j);
+                                    if (resolved)
+                                        bt = resolved;
+                                    else if (ed->enm.variant_types[j])
                                         bt = ed->enm.variant_types[j];
                                     break;
                                 }
@@ -5292,6 +5503,10 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
             const char *subject_name = n->typeswitch.subject_name;
             if (subject_name && strcmp(subject_name, "#") == 0) {
                 subject_ty = sc->cur_ret;
+            } else if (subject_name && sc->cur_generic &&
+                       strcmp(subject_name, sc->cur_generic) == 0) {
+                subject_ty = make_type(sc->arena, TY_GENERIC);
+                subject_ty->generic.param = sc->cur_generic;
             } else if (subject_name) {
                 SemEntry *se = sem_lookup(sc, subject_name);
                 if (se) subject_ty = se->type;
@@ -5303,6 +5518,7 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                             subject_ty ? type_to_llvm(subject_ty) : "(unknown)");
                 sc->had_error = true;
             }
+
 
             for (int i = 0; i < n->typeswitch.case_count; i++)
                 sem_check_stmt(sc, n->typeswitch.cases[i]->typecase.body);
@@ -5319,6 +5535,10 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
             break;
     }
     sc->source_path = saved_source_path;
+}
+
+static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
+    sem_check_stmt_impl(sc, n);
 }
 
 void semantic_check(ASTNode *program) {
@@ -5356,6 +5576,12 @@ void semantic_check(ASTNode *program) {
                 break;
             }
             case ND_ENUM_DECL: {
+                for (int j = 0; j < it->enm.variant_count; j++) {
+                    if (it->enm.variant_types[j])
+                        it->enm.variant_types[j] = sem_normalize_type_params(
+                            it->enm.variant_types[j], it->enm.generic_params,
+                            it->enm.generic_param_count);
+                }
                 Type *ty = make_type(sc.arena, TY_ENUM);
                 ty->named.name = it->enm.name;
                 sem_define(&sc, it->enm.name, ty, it->line, false);
@@ -5730,6 +5956,30 @@ static const char *named_llvm_type(Codegen *cg, const char *name) {
     return "i64";
 }
 
+static Type *copy_type_with_subst(Type *t, const char **params, Type **actuals,
+                                  int count, Arena *a);
+
+static Type *resolve_named_payload_type(Codegen *cg, Type *enum_ty, ASTNode *ed,
+                                       int variant_index) {
+    if (!ed || variant_index < 0 || variant_index >= ed->enm.variant_count)
+        return NULL;
+    Type *payload = ed->enm.variant_types[variant_index];
+    if (!payload) return NULL;
+    if (!enum_ty || !enum_ty->named.name ||
+        strcmp(enum_ty->named.name, ed->enm.name) != 0)
+        return payload;
+    if (enum_ty->named.generic_arg_count == 0) return payload;
+    if (enum_ty->named.generic_arg_count == 1 && payload->kind == TY_GENERIC)
+        return enum_ty->named.generic_args[0];
+    if (ed->enm.generic_param_count > 0 &&
+        enum_ty->named.generic_arg_count >= ed->enm.generic_param_count) {
+        return copy_type_with_subst(payload, ed->enm.generic_params,
+                                    enum_ty->named.generic_args,
+                                    ed->enm.generic_param_count, cg->arena);
+    }
+    return payload;
+}
+
 static const char *cg_type_to_llvm(Codegen *cg, Type *t) {
     if (!t) return "void";
     if (t->kind == TY_STRUCT || t->kind == TY_ENUM)
@@ -5769,6 +6019,14 @@ static Type *clone_type_subst(Codegen *cg, Type *t, const char *gname,
         case TY_STRUCT:
         case TY_ENUM:
             n->named.name = t->named.name;
+            if (t->named.generic_arg_count > 0) {
+                n->named.generic_arg_count = t->named.generic_arg_count;
+                n->named.generic_args = arena_alloc(
+                    cg->arena, sizeof(Type *) * (size_t)t->named.generic_arg_count);
+                for (int i = 0; i < t->named.generic_arg_count; i++)
+                    n->named.generic_args[i] = clone_type_subst(
+                        cg, t->named.generic_args[i], gname, actual);
+            }
             break;
         case TY_FUNC:
             n->func.param_count = t->func.param_count;
@@ -7051,11 +7309,17 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             EMITI("store i32 %d, ptr %%t%d", tag, tp);
 
             if (n->enum_field.arg_count > 0) {
-                const char *pval = gen_expr(cg, n->enum_field.args[0]);
-                Type *pt2 = ed->enm.variant_types[tag];
+                ASTNode *argn = n->enum_field.args[0];
+                const char *pval = gen_expr(cg, argn);
+                Type *arg_ty = resolved_expr_type(cg, argn);
+                Type *enum_ty = n->ty;
+                if (!enum_ty && argn)
+                    enum_ty = argn->ty;
+                Type *pt2 = resolve_named_payload_type(cg, enum_ty, ed, tag);
 
-                if (!pt2 || pt2->kind == TY_GENERIC || pt2->kind == TY_CONTEXT)
-                    pt2 = make_type(a, TY_I64);
+                if (!pt2) pt2 = arg_ty ? arg_ty : make_type(a, TY_VOID);
+                if (arg_ty)
+                    pval = coerce_value(cg, pval, arg_ty, pt2);
                 const char *pty_s = cg_type_to_llvm(cg, pt2);
                 int pp = new_tmp(cg);
 
@@ -7573,7 +7837,8 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             const char *cond = gen_expr(cg, n->ifstmt.cond);
             int then_lbl = new_lbl(cg);
             int else_lbl = new_lbl(cg);
-            int merge_lbl = new_lbl(cg);
+            int merge_lbl = -1;
+            bool needs_merge = false;
 
             owned_tmp_flush(cg);
             EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
@@ -7581,15 +7846,24 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
             EMIT_LABEL(then_lbl);
             gen_stmt(cg, n->ifstmt.then_body);
-            if (!cg->block_terminated)
+            if (!cg->block_terminated) {
+                if (merge_lbl < 0) merge_lbl = new_lbl(cg);
+                needs_merge = true;
                 EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
+            }
 
             EMIT_LABEL(else_lbl);
             if (n->ifstmt.else_body) gen_stmt(cg, n->ifstmt.else_body);
-            if (!cg->block_terminated)
+            if (!cg->block_terminated) {
+                if (merge_lbl < 0) merge_lbl = new_lbl(cg);
+                needs_merge = true;
                 EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
+            }
 
-            EMIT_LABEL(merge_lbl);
+            if (needs_merge)
+                EMIT_LABEL(merge_lbl);
+            else
+                cg->block_terminated = true;
             break;
         }
 
@@ -7662,13 +7936,19 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
         case ND_MATCH: {
             ASTNode *subj_node = n->match.subject;
+            Type *subj_ty = subj_node ? subj_node->ty : NULL;
             const char *enum_name = NULL;
             if (subj_node->kind == ND_IDENT) {
                 SymEntry *e = sym_lookup(cg, subj_node->ident.name);
                 if (e && e->type &&
-                    (e->type->kind == TY_STRUCT || e->type->kind == TY_ENUM))
+                    (e->type->kind == TY_STRUCT || e->type->kind == TY_ENUM)) {
                     enum_name = e->type->named.name;
+                    if (!subj_ty) subj_ty = e->type;
+                }
             }
+            if (!enum_name && subj_ty &&
+                (subj_ty->kind == TY_STRUCT || subj_ty->kind == TY_ENUM))
+                enum_name = subj_ty->named.name;
             ASTNode *ed = enum_name ? find_enum(cg, enum_name) : NULL;
             const char *ety = enum_name
                                   ? arena_sprintf(a, "%%enum.%s", enum_name)
@@ -7719,28 +7999,29 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                         lbl_name(cg, arm_lbls[i]));
             fprintf(cg->out, "  ]\n");
 
+            bool need_merge = false;
             for (int i = 0; i < n->match.arm_count; i++) {
                 EMIT_LABEL(arm_lbls[i]);
                 ASTNode *arm = n->match.arms[i];
                 scope_push(cg);
 
                 if (arm->match_arm.bind_name && subj_ptr) {
-                    Type *payload_ty = make_type(a, TY_I64);
+                    Type *payload_ty = NULL;
                     if (ed) {
                         for (int j = 0; j < ed->enm.variant_count; j++) {
                             if (strcmp(ed->enm.variant_names[j],
                                        arm->match_arm.variant) == 0) {
-                                if (ed->enm.variant_types[j])
+                                payload_ty = resolve_named_payload_type(
+                                    cg, subj_ty, ed, j);
+                                if (!payload_ty)
                                     payload_ty = ed->enm.variant_types[j];
                                 break;
                             }
                         }
                     }
 
-                    if (payload_ty->kind == TY_STRUCT ||
-                        payload_ty->kind == TY_GENERIC)
-                        payload_ty = make_type(a, TY_I64);
-                    const char *pty_s = type_to_llvm(payload_ty);
+                    if (!payload_ty) payload_ty = make_type(a, TY_VOID);
+                    const char *pty_s = cg_type_to_llvm(cg, payload_ty);
 
                     int pp = new_tmp(cg);
                     EMITI(
@@ -7758,13 +8039,15 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 }
                 gen_stmt(cg, arm->match_arm.body);
                 scope_pop(cg);
-                if (!cg->block_terminated)
+                if (!cg->block_terminated) {
+                    need_merge = true;
                     EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
+                }
             }
             EMIT_LABEL(default_lbl);
-            if (!cg->block_terminated)
-                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
-            EMIT_LABEL(merge_lbl);
+            owned_tmp_flush(cg);
+            EMIT_TERM("unreachable");
+            if (need_merge) EMIT_LABEL(merge_lbl);
             break;
         }
 
