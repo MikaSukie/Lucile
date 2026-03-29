@@ -1,18 +1,29 @@
-CC      = clang
-CFLAGS  = -std=c11 -Wall -Wextra -g
-SRCS    = lucile.c
-OBJS    = $(SRCS:.c=.o)
-TARGET  = lucile
+CC      := clang
+CFLAGS  := -std=c11 -Wall -Wextra -O2
+LDFLAGS :=
+
+SRCS    := lucile.c
+OBJS    := $(SRCS:.c=.o)
+TARGET  := lucile
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
 %.o: %.c lucile.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJS) $(TARGET) *.ll
 
-.PHONY: all clean
+run: $(TARGET)
+	./$(TARGET)
+
+debug: CFLAGS += -g -O0
+debug: clean $(TARGET)
+
+release: CFLAGS += -O3 -DNDEBUG
+release: clean $(TARGET)
+
+.PHONY: all clean run debug release
