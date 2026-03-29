@@ -285,7 +285,7 @@ C style casting with standard precedence rules.
 
 ## Crumb system
 
-The crumb system controls read and write permissions.
+The crumb system controls read and write permissions and ownership cleanup.
 
 ### Syntax
 
@@ -307,6 +307,10 @@ The crumb system controls read and write permissions.
 - Only one active writer allowed
 - Writing revokes prior references
 - Stale references must be revalidated
+- A crumbled value becomes unusable after `dropall(...)`
+- When a crumbled value is unusable and its lifetime ends, the compiler emits cleanup/free for the owned value
+- Overwriting an owned pointer value also releases the prior contents before the new value is stored
+- `return`, `break`, `continue`, and normal scope exit must trigger cleanup for live owned crumbled values
 - Compiler tracks usage and enforces limits
 
 ### Required usage targets
@@ -322,13 +326,12 @@ Crumb declarations are required for:
 ### Optional usage
 
 - Stack locals
+- Scalars
 - Non mutable variables
 
 ### Drop behavior
 
 - Scope based automatic cleanup
-- dropall forces exhaustion
-
 ---
 
 ## Mutability
