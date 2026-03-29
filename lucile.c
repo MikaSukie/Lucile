@@ -68,6 +68,7 @@ typedef enum {
     TOK_DROPALL,
     TOK_READONLY,
     TOK_WRITEONLY,
+    TOK_TRANSFER,
     TOK_BR,
     TOK_CONT,
     TOK_ARGV,
@@ -387,6 +388,8 @@ typedef struct ASTNode {
             bool is_dropall;
             bool is_readonly;
             bool is_writeonly;
+            bool is_transfer;
+            const char *transfer_dst;
         } crumble;
 
         struct {
@@ -574,6 +577,7 @@ typedef struct {
     Type *cur_ret;
     bool ret_emitted;
     bool suppress_warn;
+    bool warn_mode;
     const char *target_datalayout;
     const char *target_triple;
     const char *generic_name;
@@ -648,6 +652,7 @@ const char *g_source = NULL;
 const char *g_source_path = NULL;
 static const char *g_target_datalayout = NULL;
 static const char *g_target_triple = NULL;
+static bool g_cwarn_mode = false;
 
 static char *g_imported_paths[1024];
 static int g_imported_count = 0;
@@ -908,9 +913,11 @@ static void dump_ast(ASTNode *n, int depth) {
             fprintf(stderr, " w=");
             if (n->crumble.write_limit < 0) fputs("unlimited", stderr);
             else fprintf(stderr, "%d", n->crumble.write_limit);
-            if (n->crumble.is_dropall) fputs(" dropall", stderr);
-            if (n->crumble.is_readonly) fputs(" readonly", stderr);
+            if (n->crumble.is_dropall)  fputs(" dropall", stderr);
+            if (n->crumble.is_readonly)  fputs(" readonly", stderr);
             if (n->crumble.is_writeonly) fputs(" writeonly", stderr);
+            if (n->crumble.is_transfer)
+                fprintf(stderr, " transfer->%s", n->crumble.transfer_dst ? n->crumble.transfer_dst : "?");
             break;
         default:
             break;
@@ -1043,6 +1050,7 @@ int main(int argc, char **argv) {
 
     g_target_datalayout = NULL;
     g_target_triple = NULL;
+    g_cwarn_mode = false;
 
     char *source = read_file(input_path);
     register_source_file(input_path, source);
@@ -1363,6 +1371,32 @@ void lc_error_tok_at(const char *path, int line, int col, int toklen,
     g_errors++;
 }
 
+void lc_warn_at(const char *path, int line, int col, int toklen,
+                const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    diag_use_source_path(path);
+    fprintf(stderr, "Warning: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    if (toklen < 1) toklen = 1;
+    print_source_line(path, line, col, toklen);
+}
+
+void lc_warn_tok_at(const char *path, int line, int col, int toklen,
+                    const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    diag_use_source_path(path);
+    fprintf(stderr, "Warning: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    if (toklen < 1) toklen = 1;
+    print_source_line(path, line, col, toklen);
+}
+
 void lc_warn(int line, const char *fmt, ...) {
     (void)line;
     va_list ap;
@@ -1370,6 +1404,46 @@ void lc_warn(int line, const char *fmt, ...) {
     fprintf(stderr, "Warning: ");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
+    va_end(ap);
+}
+
+typedef struct CC CC;
+
+static void crumb_vdiag(CC *cc, const char *path, int line, int col,
+                        int toklen, bool as_warning, const char *fmt,
+                        va_list ap) {
+    (void)cc;
+    if (as_warning) {
+        diag_use_source_path(path);
+        fprintf(stderr, "Warning: ");
+        vfprintf(stderr, fmt, ap);
+        fprintf(stderr, "\n");
+        if (toklen < 1) toklen = 1;
+        print_source_line(path, line, col, toklen);
+    } else {
+        diag_use_source_path(path);
+        fprintf(stderr, "Error: ");
+        vfprintf(stderr, fmt, ap);
+        fprintf(stderr, "\n");
+        if (toklen < 1) toklen = 1;
+        print_source_line(path, line, col, toklen);
+        g_errors++;
+    }
+}
+
+static void crumb_diag_tok(CC *cc, const char *path, int line, int col,
+                           int toklen, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    crumb_vdiag(cc, path, line, col, toklen, g_cwarn_mode, fmt, ap);
+    va_end(ap);
+}
+
+static void crumb_diag_line(CC *cc, const char *path, int line, int col,
+                            const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    crumb_vdiag(cc, path, line, col, 1, g_cwarn_mode, fmt, ap);
     va_end(ap);
 }
 
@@ -2347,24 +2421,40 @@ static ASTNode *parse_crumble_stmt(Parser *p) {
     TokenType kind = p->cur.type;
     advance_tok(p);
 
-    n->crumble.read_limit = -1;
+    n->crumble.read_limit  = -1;
     n->crumble.write_limit = -1;
-    n->crumble.is_dropall = (kind == TOK_DROPALL);
-    n->crumble.is_readonly = (kind == TOK_READONLY);
-    n->crumble.is_writeonly = (kind == TOK_WRITEONLY);
+    n->crumble.is_dropall    = (kind == TOK_DROPALL);
+    n->crumble.is_readonly   = (kind == TOK_READONLY);
+    n->crumble.is_writeonly  = (kind == TOK_WRITEONLY);
+    n->crumble.is_transfer   = (kind == TOK_TRANSFER);
+    n->crumble.transfer_dst  = NULL;
 
     if (kind == TOK_DROPALL) {
-        n->crumble.read_limit = 0;
+        n->crumble.read_limit  = 0;
         n->crumble.write_limit = 0;
     }
-    if (kind == TOK_READONLY) {
-        n->crumble.write_limit = 0;
-    }
-    if (kind == TOK_WRITEONLY) {
-        n->crumble.read_limit = 0;
-    }
+    if (kind == TOK_READONLY)  n->crumble.write_limit = 0;
+    if (kind == TOK_WRITEONLY) n->crumble.read_limit  = 0;
 
     expect(p, TOK_LPAREN, "(");
+
+    if (kind == TOK_TRANSFER) {
+        const char *src = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        expect(p, TOK_IDENT, "source variable name");
+        expect(p, TOK_COMMA, ",");
+        const char *dst = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        expect(p, TOK_IDENT, "destination variable name");
+        expect(p, TOK_RPAREN, ")");
+
+        const char **vars = arena_alloc(a, sizeof(const char *));
+        vars[0] = src;
+        n->crumble.vars         = vars;
+        n->crumble.var_count    = 1;
+        n->crumble.transfer_dst = dst;
+        stmt_terminator(p);
+        return n;
+    }
+
     const char **vars = NULL;
     int vc = 0, vcap = 0;
     while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
@@ -2397,7 +2487,7 @@ static ASTNode *parse_crumble_stmt(Parser *p) {
         }
     }
 
-    n->crumble.vars = vars;
+    n->crumble.vars      = vars;
     n->crumble.var_count = vc;
     stmt_terminator(p);
     return n;
@@ -2515,6 +2605,7 @@ static bool token_starts_item(TokenType t) {
         case TOK_DROPALL:
         case TOK_READONLY:
         case TOK_WRITEONLY:
+        case TOK_TRANSFER:
         case TOK_STRUCT:
         case TOK_PACKED:
         case TOK_ENUM:
@@ -2685,7 +2776,8 @@ static ASTNode *parse_stmt(Parser *p) {
     }
 
     if (check(p, TOK_CRUMBLE) || check(p, TOK_DROPALL) ||
-        check(p, TOK_READONLY) || check(p, TOK_WRITEONLY)) {
+        check(p, TOK_READONLY) || check(p, TOK_WRITEONLY) ||
+        check(p, TOK_TRANSFER)) {
         return parse_crumble_stmt(p);
     }
 
@@ -3142,6 +3234,11 @@ ASTNode *parse_program(Parser *p) {
         if (check(p, TOK_AT)) {
             const char *dname = p->cur.sval ? p->cur.sval : "";
             advance_tok(p);
+            if (strcmp(dname, "cwarn") == 0) {
+                expect(p, TOK_SEMICOLON, ";");
+                g_cwarn_mode = true;
+                continue;
+            }
             expect(p, TOK_EQ, "=");
             if (!check(p, TOK_STRING_LIT)) {
                 lc_error(p->cur.line, p->cur.col,
@@ -3306,6 +3403,7 @@ static Keyword keywords[] = {{"ret", TOK_RET},
                              {"dropall", TOK_DROPALL},
                              {"readonly", TOK_READONLY},
                              {"writeonly", TOK_WRITEONLY},
+                             {"transfer", TOK_TRANSFER},
                              {"br", TOK_BR},
                              {"cont", TOK_CONT},
                              {"argv", TOK_ARGV},
@@ -3323,6 +3421,7 @@ static Keyword keywords[] = {{"ret", TOK_RET},
                              {"f32", TOK_F32},
                              {"f64", TOK_F64},
                              {"str", TOK_STRING_KW},
+                             {"string", TOK_STRING_KW},
                              {"char", TOK_CHAR_KW},
                              {"bool", TOK_BOOL_KW},
                              {"void", TOK_VOID_KW},
@@ -3758,7 +3857,7 @@ const char *token_type_name(TokenType t) {
             N(TOK_STRUCT) N(TOK_PACKED) N(TOK_ENUM) N(TOK_MATCH) N(TOK_EXTERN)
                 N(TOK_UNSAFE) N(TOK_IMPORT) N(TOK_IN) N(TOK_TYPESWITCH) N(
                     TOK_TYPECASE) N(TOK_FALLBACK) N(TOK_NOMD) N(TOK_CRUMBLE) N(TOK_DROPALL)
-                    N(TOK_READONLY) N(TOK_WRITEONLY) N(TOK_BR) N(TOK_CONT) N(
+                    N(TOK_READONLY) N(TOK_WRITEONLY) N(TOK_TRANSFER) N(TOK_BR) N(TOK_CONT) N(
                         TOK_LPAREN) N(TOK_RPAREN) N(TOK_LBRACE) N(TOK_RBRACE)
                         N(TOK_LBRACKET) N(TOK_RBRACKET) N(TOK_SEMICOLON) N(
                             TOK_COMMA) N(TOK_DOT) N(TOK_ARROW) N(TOK_HASH) N(TOK_AT)
@@ -3787,7 +3886,7 @@ const char *token_type_name(TokenType t) {
 /* ================================================================
    CRUMB CHECKER
    Tracks read/write limits per variable and enforces them at
-   compile time. Also flags unlimited usage with warnings.
+   compile time. Emits smart, actionable heap-lifetime hints.
    ================================================================ */
 
 typedef struct CrumbInfo {
@@ -3798,11 +3897,24 @@ typedef struct CrumbInfo {
     int reads_used;
     int writes_used;
     int decl_line;
+    const char *decl_path;
     bool warn_unlimited;
     bool suppress_scope_warn;
     bool explicit_drop;
     bool alive;
+    bool moved_from;
     bool loop_warn_emitted;
+
+    bool from_extern;
+    bool from_transfer;
+
+    bool was_written;
+    bool was_passed_to_call;
+    bool was_transferred_out;
+
+    bool requires_crumble;
+    bool has_crumble;
+
     struct CrumbInfo *next;
 } CrumbInfo;
 
@@ -3811,10 +3923,11 @@ typedef struct CrumbScope {
     struct CrumbScope *parent;
 } CrumbScope;
 
-typedef struct {
+typedef struct CC {
     CrumbScope *scope;
     bool had_error;
     bool suppress_warn;
+    bool warn_mode;
     Arena *arena;
     ASTNode *program;
     const char **extern_names;
@@ -3822,50 +3935,6 @@ typedef struct {
     int extern_cap;
     int loop_depth;
 } CC;
-
-static bool crumb_type_is_owned(Type *ty) {
-    if (!ty) return false;
-    switch (ty->kind) {
-        case TY_STRING:
-        case TY_PTR:
-        case TY_ARRAY:
-        case TY_STRUCT:
-        case TY_ENUM:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool crumb_type_is_scalar(Type *ty) {
-    if (!ty) return false;
-    switch (ty->kind) {
-        case TY_VOID:
-        case TY_BOOL:
-        case TY_I8:
-        case TY_I16:
-        case TY_I32:
-        case TY_I64:
-        case TY_U8:
-        case TY_U16:
-        case TY_U32:
-        case TY_U64:
-        case TY_F32:
-        case TY_F64:
-        case TY_CHAR:
-        case TY_INT_GENERIC:
-        case TY_FLOAT_GENERIC:
-        case TY_CONTEXT:
-        case TY_GENERIC:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool crumb_needs_ownership_tracking(Type *ty) {
-    return crumb_type_is_owned(ty) && !crumb_type_is_scalar(ty);
-}
 
 static CrumbScope *crumb_push(CC *cc) {
     CrumbScope *s = arena_alloc(cc->arena, sizeof(CrumbScope));
@@ -3884,80 +3953,125 @@ static CrumbInfo *crumb_scope_find(CrumbScope *s, const char *name) {
     return NULL;
 }
 
+static bool is_heap_backed_type(Type *ty) {
+    if (!ty) return false;
+    switch (ty->kind) {
+        case TY_STRING:
+        case TY_PTR:
+            return true;
+        case TY_ARRAY:
+            return ty->array.count < 0;
+        case TY_STRUCT:
+        case TY_ENUM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool crumb_type_requires_decl(Type *ty, bool from_extern,
+                                     bool is_mutable, bool is_ptr_or_ref) {
+    if (!ty) return false;
+    if (from_extern && is_heap_backed_type(ty)) return true;
+    if (is_ptr_or_ref && (ty->kind == TY_PTR)) return true;
+    if (is_mutable && (ty->kind == TY_STRUCT || ty->kind == TY_ENUM)) return true;
+    if (is_mutable && is_heap_backed_type(ty)) return true;
+    return false;
+}
+
+static void crumb_scope_pop_warnings(CC *cc) {
+    CrumbScope *s = cc->scope;
+    for (CrumbInfo *e = s->head; e; e = e->next) {
+        if (!e->alive) continue;
+
+        const char *path = e->decl_path;
+        int col = source_ident_col_at(path, e->decl_line, e->name);
+        int toklen = e->name ? (int)strlen(e->name) : 1;
+
+        if (e->warn_unlimited) {
+            if (e->reads_left == -1 && e->reads_used > 0)
+                crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                               "[CrumbChecker] '%s' had unlimited reads (%d detected); consider crumble(%s)!r=%d",
+                               e->name, e->reads_used, e->name, e->reads_used);
+            if (e->writes_left == -1 && e->writes_used > 0)
+                crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                               "[CrumbChecker] '%s' had unlimited writes (%d detected); consider crumble(%s)!w=%d",
+                               e->name, e->writes_used, e->name, e->writes_used);
+        }
+
+        if (e->suppress_scope_warn) {
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (e->requires_crumble && !e->has_crumble && !e->moved_from &&
+            !e->was_transferred_out && !e->explicit_drop) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' requires a crumble declaration (heap-backed / mutable owned type) but none was provided; add crumble(%s)!r=N!w=N, dropall(%s), or transfer(%s, dst)",
+                           e->name, e->name, e->name, e->name);
+        }
+
+        if (e->moved_from || e->was_transferred_out) {
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (e->from_extern && is_heap_backed_type(e->type) &&
+            !e->explicit_drop && e->alive) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' originates from extern and was never explicitly dropped or transferred; call dropall(%s) before scope end or transfer(%s, dst)",
+                           e->name, e->name, e->name);
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (e->was_passed_to_call && is_heap_backed_type(e->type) &&
+            !e->explicit_drop && !e->from_extern) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' was passed to a call but its lifetime could not be proven; consider dropall(%s) or transfer(%s, dst)",
+                           e->name, e->name, e->name);
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (e->was_written && is_heap_backed_type(e->type) &&
+            !e->explicit_drop && e->writes_used > 0) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' was written and may now own a new heap value; call dropall(%s) before scope end to make cleanup explicit",
+                           e->name, e->name);
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (e->reads_used + e->writes_used == 0 && is_heap_backed_type(e->type)) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' was declared but never touched; if it owns heap data, call dropall(%s) before scope end",
+                           e->name, e->name);
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
+            continue;
+        }
+
+        if (is_heap_backed_type(e->type) && !e->explicit_drop &&
+            e->reads_used + e->writes_used > 0) {
+            crumb_diag_tok(cc, path, e->decl_line, col, toklen,
+                           "[CrumbChecker] '%s' is heap-backed and will be auto-dropped at scope end; use dropall(%s) to make cleanup explicit",
+                           e->name, e->name);
+        }
+
+        e->reads_left = 0; e->writes_left = 0; e->alive = false;
+    }
+}
+
 static void crumb_pop(CC *cc) {
     if (!cc || !cc->scope) return;
-
-    CrumbScope *s = cc->scope;
-
-    if (!cc->suppress_warn) {
-        for (CrumbInfo *e = s->head; e; e = e->next) {
-            if (!e->alive) continue;
-
-            if (e->warn_unlimited) {
-                if (e->reads_left == -1 && e->reads_used > 0) {
-                    lc_warn(e->decl_line,
-                            "[CrumbChecker] '%s' had unlimited reads (%d detected); "
-                            "consider crumble(%s)!r=%d",
-                            e->name, e->reads_used, e->name, e->reads_used);
-                }
-                if (e->writes_left == -1 && e->writes_used > 0) {
-                    lc_warn(e->decl_line,
-                            "[CrumbChecker] '%s' had unlimited writes (%d detected); "
-                            "consider crumble(%s)!w=%d",
-                            e->name, e->writes_used, e->name, e->writes_used);
-                }
-            }
-
-            if (e->suppress_scope_warn) {
-                e->reads_left = 0;
-                e->writes_left = 0;
-                e->alive = false;
-                continue;
-            }
-
-            if (crumb_needs_ownership_tracking(e->type) &&
-                (!e->explicit_drop || e->reads_left != 0 ||
-                 e->writes_left != 0) &&
-                e->reads_used + e->writes_used > 0) {
-                lc_warn(e->decl_line,
-                        "[CrumbChecker] auto-dropping '%s' at scope end; use dropall(%s)"
-                        " to make the cleanup explicit",
-                        e->name, e->name);
-            }
-
-            if (crumb_needs_ownership_tracking(e->type) &&
-                e->type && (e->type->kind == TY_STRUCT ||
-                            e->type->kind == TY_ENUM) &&
-                e->reads_used + e->writes_used > 0 &&
-                !e->explicit_drop) {
-                lc_warn(e->decl_line,
-                        "[CrumbChecker] '%s' is a compound type dropped at scope end; "
-                        "if it owns heap resources, call dropall(%s) and free "
-                        "fields manually to avoid leaks",
-                        e->name, e->name);
-            }
-
-            if (crumb_needs_ownership_tracking(e->type) &&
-                e->reads_used + e->writes_used == 0) {
-                lc_warn(e->decl_line,
-                        "[CrumbChecker] '%s' was declared but never accessed; "
-                        "scope cleanup will still drop it",
-                        e->name);
-            }
-
-            e->reads_left = 0;
-            e->writes_left = 0;
-            e->alive = false;
-        }
-    } else {
-        for (CrumbInfo *e = s->head; e; e = e->next) {
-            e->reads_left = 0;
-            e->writes_left = 0;
-            e->alive = false;
+    if (!cc->suppress_warn)
+        crumb_scope_pop_warnings(cc);
+    else {
+        for (CrumbInfo *e = cc->scope->head; e; e = e->next) {
+            e->reads_left = 0; e->writes_left = 0; e->alive = false;
         }
     }
-
-    cc->scope = s->parent;
+    cc->scope = cc->scope->parent;
 }
 
 static CrumbInfo *crumb_find(CC *cc, const char *name) {
@@ -3965,186 +4079,212 @@ static CrumbInfo *crumb_find(CC *cc, const char *name) {
     return crumb_scope_find(cc->scope, name);
 }
 
-static void crumb_declare(CC *cc, const char *name, Type *ty, int line,
-                           bool warn_unlimited) {
+static void crumb_declare(CC *cc, const char *name, Type *ty,
+                           const char *path, int line,
+                           bool warn_unlimited, bool from_extern,
+                           bool is_mutable) {
     if (!cc || !cc->scope || !name) return;
     CrumbInfo *e = arena_alloc(cc->arena, sizeof(CrumbInfo));
-    e->name = name;
-    e->type = ty;
-    e->reads_left = -1;
-    e->writes_left = -1;
-    e->reads_used = 0;
-    e->writes_used = 0;
-    e->decl_line = line;
-    e->warn_unlimited = warn_unlimited;
-    e->suppress_scope_warn = false;
-    e->explicit_drop = false;
-    e->alive = true;
-    e->next = cc->scope->head;
-    cc->scope->head = e;
+    memset(e, 0, sizeof(*e));
+    e->name             = name;
+    e->type             = ty;
+    e->decl_path        = path;
+    e->reads_left       = -1;
+    e->writes_left      = -1;
+    e->decl_line        = line;
+    e->warn_unlimited   = warn_unlimited;
+    e->alive            = true;
+    e->from_extern      = from_extern;
+    e->requires_crumble = crumb_type_requires_decl(ty, from_extern,
+                                                    is_mutable, false);
+    e->next             = cc->scope->head;
+    cc->scope->head     = e;
 }
 
-static void crumb_apply(CC *cc, ASTNode *crumble_node) {
-    for (int i = 0; i < crumble_node->crumble.var_count; i++) {
-        const char *name = crumble_node->crumble.vars[i];
+static void crumb_apply(CC *cc, ASTNode *cn) {
+    const char *path = cn ? cn->source_path : NULL;
+    int line = cn ? cn->line : 0;
+    int col = source_first_content_col_at(path, line);
+
+    if (cn->crumble.is_transfer) {
+        const char *sname = cn->crumble.var_count > 0 ? cn->crumble.vars[0] : NULL;
+        const char *dname = cn->crumble.transfer_dst;
+        CrumbInfo *src = sname ? crumb_find(cc, sname) : NULL;
+        CrumbInfo *dst = dname ? crumb_find(cc, dname) : NULL;
+
+        if (!src) {
+            crumb_diag_line(cc, path, line, col,
+                            "[CrumbChecker] transfer: source '%s' not found in scope",
+                            sname ? sname : "?");
+            cc->had_error = true;
+        } else {
+            if (!src->alive) {
+                crumb_diag_line(cc, path, line, col,
+                                "[CrumbChecker] transfer: source '%s' is already dead",
+                                sname);
+                cc->had_error = true;
+            } else {
+                src->was_transferred_out = true;
+                src->moved_from          = true;
+                src->reads_left          = 0;
+                src->writes_left         = 0;
+                src->explicit_drop       = true;
+            }
+        }
+
+        if (!dst) {
+            crumb_diag_line(cc, path, line, col,
+                            "[CrumbChecker] transfer: destination '%s' not found in scope; declare it first, then supply its own crumble declaration",
+                            dname ? dname : "?");
+            cc->had_error = true;
+        } else {
+            dst->from_extern   = src ? src->from_extern : false;
+            dst->from_transfer = true;
+            dst->requires_crumble = is_heap_backed_type(dst->type);
+            dst->has_crumble   = false;
+        }
+        return;
+    }
+
+    for (int i = 0; i < cn->crumble.var_count; i++) {
+        const char *name = cn->crumble.vars[i];
         CrumbInfo *e = crumb_find(cc, name);
+        int ncol = source_ident_col_at(path, line, name);
         if (!e) {
-            lc_error(crumble_node->line, 0,
-                     "[CrumbChecker] variable '%s' not found in scope", name);
+            crumb_diag_tok(cc, path, line, ncol, (int)strlen(name),
+                           "[CrumbChecker] variable '%s' not found in scope", name);
             cc->had_error = true;
             continue;
         }
 
-        bool missing_r = (crumble_node->crumble.read_limit < 0) &&
-                         !crumble_node->crumble.is_dropall &&
-                         !crumble_node->crumble.is_writeonly;
-        bool missing_w = (crumble_node->crumble.write_limit < 0) &&
-                         !crumble_node->crumble.is_dropall &&
-                         !crumble_node->crumble.is_readonly;
-
-        if (crumble_node->crumble.read_limit >= 0) {
-            e->reads_left = crumble_node->crumble.read_limit;
-            e->warn_unlimited = false;
-        }
-        if (crumble_node->crumble.write_limit >= 0) {
-            e->writes_left = crumble_node->crumble.write_limit;
-            e->warn_unlimited = false;
-        }
-        if (crumble_node->crumble.is_dropall) {
-            e->reads_left = 0;
-            e->writes_left = 0;
-            e->explicit_drop = true;
-            e->warn_unlimited = false;
-        }
-        if (crumble_node->crumble.is_readonly) {
-            e->writes_left = 0;
-            e->warn_unlimited = false;
-        }
-        if (crumble_node->crumble.is_writeonly) {
-            e->reads_left = 0;
-            e->warn_unlimited = false;
-        }
-
-        if (crumble_node->crumble.is_dropall ||
-            crumble_node->crumble.is_readonly ||
-            crumble_node->crumble.is_writeonly) {
-            continue;
-        }
-
+        bool missing_r = (cn->crumble.read_limit  < 0) &&
+                         !cn->crumble.is_dropall && !cn->crumble.is_writeonly;
+        bool missing_w = (cn->crumble.write_limit < 0) &&
+                         !cn->crumble.is_dropall && !cn->crumble.is_readonly;
         if (missing_r || missing_w) {
-            char missing[64];
-            missing[0] = '\0';
+            char missing[64]; missing[0] = '\0';
             if (missing_r) strcat(missing, "!r");
             if (missing_r && missing_w) strcat(missing, " and ");
             if (missing_w) strcat(missing, "!w");
-            lc_warn(crumble_node->line,
-                    "[CrumbChecker] crumble(%s) omits %s; missing limits are "
-                    "treated as unlimited",
-                    name, missing);
+            crumb_diag_tok(cc, path, line, ncol, (int)strlen(name),
+                           "[CrumbChecker] crumble(%s) omits %s; missing limits are treated as unlimited",
+                           name, missing);
         }
+
+        if (cn->crumble.read_limit  >= 0) {
+            e->reads_left     = cn->crumble.read_limit;
+            e->warn_unlimited = false;
+        }
+        if (cn->crumble.write_limit >= 0) {
+            e->writes_left    = cn->crumble.write_limit;
+            e->warn_unlimited = false;
+        }
+        if (cn->crumble.is_dropall) {
+            e->reads_left     = 0;
+            e->writes_left    = 0;
+            e->explicit_drop  = true;
+            e->warn_unlimited = false;
+            e->moved_from     = false;
+        }
+        if (cn->crumble.is_readonly) {
+            e->writes_left    = 0;
+            e->warn_unlimited = false;
+        }
+        if (cn->crumble.is_writeonly) {
+            e->reads_left     = 0;
+            e->warn_unlimited = false;
+        }
+
+        e->has_crumble = true;
     }
 }
 
-static int crumb_ident_col(int line, const char *name) {
-    if (!g_source || !name || !*name || line <= 0) return 1;
-    const char *p = g_source;
-    for (int i = 1; i < line && *p; i++) {
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-    if (!*p) return 1;
-    const char *line_start = p;
-    const char *end = p;
-    while (*end && *end != '\n') end++;
-    size_t nlen = strlen(name);
-    const char *hit = p;
-    while (hit < end) {
-        hit = strstr(hit, name);
-        if (!hit || hit >= end) break;
-        bool left_ok = (hit == line_start) ||
-                       (!isalnum((unsigned char)hit[-1]) && hit[-1] != '_');
-        char r = hit[nlen];
-        bool right_ok = (r == '\0') || (!isalnum((unsigned char)r) && r != '_');
-        if (left_ok && right_ok)
-            return (int)(hit - line_start) + 1;
-        hit++;
-    }
-    int col = 1;
-    while (p < end && (*p == ' ' || *p == '\t')) { p++; col++; }
-    return col;
+static int crumb_ident_col_at(const char *path, int line, const char *name) {
+    return source_ident_col_at(path, line, name);
 }
 
-static void crumb_read(CC *cc, const char *name, int line) {
+static void crumb_read(CC *cc, const char *path, const char *name, int line) {
     CrumbInfo *e = crumb_find(cc, name);
     if (!e) return;
+    int col = crumb_ident_col_at(path, line, name);
+    int toklen = (int)strlen(name);
     if (!e->alive) {
-        int col = crumb_ident_col(line, name);
-        lc_error_tok(line, col, (int)strlen(name),
-                     "[CrumbChecker] '%s' is out of scope", name);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' is out of scope", name);
+        cc->had_error = true;
+        return;
+    }
+    if (e->moved_from) {
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' is stale (moved or transferred) and must be revalidated before read",
+                       name);
         cc->had_error = true;
         return;
     }
     if (e->reads_left == 0) {
-        int col = crumb_ident_col(line, name);
-        lc_error_tok(line, col, (int)strlen(name),
-                     "[CrumbChecker] '%s' has no reads remaining (exhausted)", name);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' has no reads remaining (exhausted)",
+                       name);
         cc->had_error = true;
         return;
     }
     if (e->reads_left > 0) e->reads_left--;
     e->reads_used++;
     if (cc->loop_depth > 0 && e->reads_left >= 0 && !e->loop_warn_emitted) {
-        lc_warn(line,
-                "[CrumbChecker] '%s' has a finite read limit (%d remaining) "
-                "inside a loop, may exhaust before the loop ends",
-                name, e->reads_left);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' has a finite read limit (%d remaining) inside a loop; may exhaust before loop ends",
+                       name, e->reads_left);
         e->loop_warn_emitted = true;
     }
 }
 
-static void crumb_write(CC *cc, const char *name, int line) {
+static void crumb_write(CC *cc, const char *path, const char *name, int line) {
     CrumbInfo *e = crumb_find(cc, name);
     if (!e) return;
+    int col = crumb_ident_col_at(path, line, name);
+    int toklen = (int)strlen(name);
     if (!e->alive) {
-        int col = crumb_ident_col(line, name);
-        lc_error_tok(line, col, (int)strlen(name),
-                     "[CrumbChecker] '%s' is out of scope", name);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' is out of scope", name);
         cc->had_error = true;
         return;
     }
     if (e->writes_left == 0) {
-        int col = crumb_ident_col(line, name);
-        lc_error_tok(line, col, (int)strlen(name),
-                     "[CrumbChecker] '%s' has no writes remaining (exhausted)", name);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' has no writes remaining (exhausted)",
+                       name);
         cc->had_error = true;
         return;
     }
     if (e->writes_left > 0) e->writes_left--;
     e->writes_used++;
+    e->moved_from  = false;
+    e->was_written = true;
     if (cc->loop_depth > 0 && e->writes_left >= 0 && !e->loop_warn_emitted) {
-        lc_warn(line,
-                "[CrumbChecker] '%s' has a finite write limit (%d remaining) "
-                "inside a loop, may exhaust before the loop ends",
-                name, e->writes_left);
+        crumb_diag_tok(cc, path, line, col, toklen,
+                       "[CrumbChecker] '%s' has a finite write limit (%d remaining) inside a loop; may exhaust before loop ends",
+                       name, e->writes_left);
         e->loop_warn_emitted = true;
     }
 }
 
-static ASTNode *crumb_root_ident(ASTNode *n) {
-    if (!n) return NULL;
-    switch (n->kind) {
-        case ND_IDENT:
-            return n;
-        case ND_FIELD:
-            return crumb_root_ident(n->field.object);
-        case ND_INDEX:
-            return crumb_root_ident(n->idx.array);
-        case ND_UNARY:
-            if (n->unary.op == TOK_STAR) return crumb_root_ident(n->unary.operand);
-            return NULL;
-        default:
-            return NULL;
+static void crumb_mark_moved(CC *cc, ASTNode *src) {
+    if (!cc || !src || src->kind != ND_IDENT) return;
+    CrumbInfo *e = crumb_find(cc, src->ident.name);
+    if (!e || !e->alive) return;
+    if (!is_heap_backed_type(e->type)) return;
+    e->moved_from = true;
+}
+
+static bool crumb_is_extern_call(CC *cc, ASTNode *expr) {
+    if (!expr || expr->kind != ND_CALL) return false;
+    ASTNode *callee = expr->call.callee;
+    if (!callee || callee->kind != ND_IDENT) return false;
+    const char *fname = callee->ident.name;
+    for (int i = 0; i < cc->extern_count; i++) {
+        if (strcmp(cc->extern_names[i], fname) == 0) return true;
     }
+    return false;
 }
 
 static void check_expr(CC *cc, ASTNode *n);
@@ -4154,7 +4294,7 @@ static void crumb_read_lvalue(CC *cc, ASTNode *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_IDENT:
-            crumb_read(cc, n->ident.name, n->line);
+            crumb_read(cc, n->source_path, n->ident.name, n->line);
             break;
         case ND_FIELD:
             crumb_read_lvalue(cc, n->field.object);
@@ -4164,11 +4304,10 @@ static void crumb_read_lvalue(CC *cc, ASTNode *n) {
             check_expr(cc, n->idx.index);
             break;
         case ND_UNARY:
-            if (n->unary.op == TOK_STAR) {
+            if (n->unary.op == TOK_STAR)
                 check_expr(cc, n->unary.operand);
-            } else {
+            else
                 check_expr(cc, n);
-            }
             break;
         default:
             check_expr(cc, n);
@@ -4180,26 +4319,20 @@ static void crumb_write_lvalue(CC *cc, ASTNode *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_IDENT:
-            crumb_write(cc, n->ident.name, n->line);
+            crumb_write(cc, n->source_path, n->ident.name, n->line);
             break;
         case ND_FIELD:
             crumb_write_lvalue(cc, n->field.object);
             break;
         case ND_INDEX:
-            crumb_read(cc, crumb_root_ident(n) ? crumb_root_ident(n)->ident.name : "?", n->line);
             check_expr(cc, n->idx.index);
             crumb_write_lvalue(cc, n->idx.array);
             break;
         case ND_UNARY:
-            if (n->unary.op == TOK_STAR) {
+            if (n->unary.op == TOK_STAR)
                 check_expr(cc, n->unary.operand);
-                ASTNode *root = crumb_root_ident(n->unary.operand);
-                if (root && root->kind == ND_IDENT) {
-                    crumb_write(cc, root->ident.name, n->line);
-                }
-            } else {
+            else
                 check_expr(cc, n);
-            }
             break;
         default:
             check_expr(cc, n);
@@ -4207,16 +4340,27 @@ static void crumb_write_lvalue(CC *cc, ASTNode *n) {
     }
 }
 
+static void crumb_mark_passed(CC *cc, ASTNode **args, int argc) {
+    for (int i = 0; i < argc; i++) {
+        ASTNode *a = args[i];
+        if (!a || a->kind != ND_IDENT) continue;
+        CrumbInfo *e = crumb_find(cc, a->ident.name);
+        if (e && e->alive) e->was_passed_to_call = true;
+    }
+}
+
 static void check_expr(CC *cc, ASTNode *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_IDENT:
-            crumb_read(cc, n->ident.name, n->line);
+            crumb_read(cc, n->source_path, n->ident.name, n->line);
             break;
         case ND_ASSIGN:
             if (n->assign.op != TOK_EQ) crumb_read_lvalue(cc, n->assign.lhs);
-            crumb_write_lvalue(cc, n->assign.lhs);
             check_expr(cc, n->assign.rhs);
+            crumb_write_lvalue(cc, n->assign.lhs);
+            if (n->assign.op == TOK_EQ)
+                crumb_mark_moved(cc, n->assign.rhs);
             break;
         case ND_BINARY:
             check_expr(cc, n->binary.lhs);
@@ -4232,6 +4376,7 @@ static void check_expr(CC *cc, ASTNode *n) {
             check_expr(cc, n->call.callee);
             for (int i = 0; i < n->call.arg_count; i++)
                 check_expr(cc, n->call.args[i]);
+            crumb_mark_passed(cc, n->call.args, n->call.arg_count);
             break;
         case ND_INDEX:
             check_expr(cc, n->idx.array);
@@ -4269,11 +4414,7 @@ static void check_expr(CC *cc, ASTNode *n) {
                 int depth = 1;
                 while (*p && depth > 0) {
                     if (*p == '{') { depth++; p++; continue; }
-                    if (*p == '}') {
-                        depth--;
-                        p++;
-                        continue;
-                    }
+                    if (*p == '}') { depth--; p++; continue; }
                     if (isalpha((unsigned char)*p) || *p == '_') {
                         char idbuf[256];
                         int ilen = 0;
@@ -4281,7 +4422,7 @@ static void check_expr(CC *cc, ASTNode *n) {
                                ilen < 255)
                             idbuf[ilen++] = *p++;
                         idbuf[ilen] = '\0';
-                        crumb_read(cc, idbuf, n->line);
+                        crumb_read(cc, n->source_path, idbuf, n->line);
                     } else {
                         p++;
                     }
@@ -4303,41 +4444,58 @@ static void check_stmt(CC *cc, ASTNode *n) {
                 check_stmt(cc, n->block.stmts[i]);
             crumb_pop(cc);
             break;
+
         case ND_VAR_DECL: {
-            bool need_tracking = crumb_needs_ownership_tracking(n->var.type);
-            crumb_declare(cc, n->var.name, n->var.type, n->line,
-                          need_tracking && !n->var.nomd);
+            bool from_ext = n->var.init && crumb_is_extern_call(cc, n->var.init);
+            bool is_mut   = !n->var.nomd;
+
+            crumb_declare(cc, n->var.name, n->var.type, n->source_path, n->line,
+                          is_heap_backed_type(n->var.type) && is_mut,
+                          from_ext, is_mut);
+
             if (n->var.nomd) {
                 CrumbInfo *e = crumb_find(cc, n->var.name);
-                if (e) e->warn_unlimited = false;
+                if (e) { e->warn_unlimited = false; e->requires_crumble = false; }
             }
-            if (n->var.init) check_expr(cc, n->var.init);
+            if (n->var.init) {
+                check_expr(cc, n->var.init);
+                crumb_mark_moved(cc, n->var.init);
+            }
             break;
         }
+
         case ND_CRUMBLE:
             crumb_apply(cc, n);
             break;
+
         case ND_ASSIGN:
             check_expr(cc, n);
             break;
+
         case ND_RETURN:
-            if (n->ret.val) check_expr(cc, n->ret.val);
+            if (n->ret.val) {
+                check_expr(cc, n->ret.val);
+                crumb_mark_moved(cc, n->ret.val);
+            }
             break;
+
         case ND_IF:
             check_expr(cc, n->ifstmt.cond);
             check_stmt(cc, n->ifstmt.then_body);
             if (n->ifstmt.else_body) check_stmt(cc, n->ifstmt.else_body);
             break;
+
         case ND_LOOP:
             crumb_push(cc);
             if (n->loop.counter) check_stmt(cc, n->loop.counter);
             cc->loop_depth++;
-            if (n->loop.cond) check_expr(cc, n->loop.cond);
-            if (n->loop.step) check_expr(cc, n->loop.step);
+            if (n->loop.cond)  check_expr(cc, n->loop.cond);
+            if (n->loop.step)  check_expr(cc, n->loop.step);
             check_stmt(cc, n->loop.body);
             cc->loop_depth--;
             crumb_pop(cc);
             break;
+
         case ND_MATCH:
             check_expr(cc, n->match.subject);
             for (int i = 0; i < n->match.arm_count; i++) {
@@ -4345,25 +4503,24 @@ static void check_stmt(CC *cc, ASTNode *n) {
                 ASTNode *arm = n->match.arms[i];
                 if (arm->match_arm.bind_name) {
                     Type *bt = n->match.subject ? n->match.subject->ty : NULL;
-                    crumb_declare(cc, arm->match_arm.bind_name, bt, arm->line,
-                                  crumb_needs_ownership_tracking(bt));
+                    crumb_declare(cc, arm->match_arm.bind_name, bt, arm->source_path, arm->line,
+                                  is_heap_backed_type(bt), false, true);
                 }
                 check_stmt(cc, arm->match_arm.body);
                 crumb_pop(cc);
             }
             break;
-        case ND_TYPESWITCH: {
-            bool saved = cc->suppress_warn;
-            cc->suppress_warn = true;
+
+        case ND_TYPESWITCH:
             for (int i = 0; i < n->typeswitch.case_count; i++)
                 check_stmt(cc, n->typeswitch.cases[i]->typecase.body);
             if (n->typeswitch.fallback) check_stmt(cc, n->typeswitch.fallback);
-            cc->suppress_warn = saved;
             break;
-        }
+
         case ND_EXPR_STMT:
             check_expr(cc, n->expr_stmt.expr);
             break;
+
         default:
             check_expr(cc, n);
             break;
@@ -4372,7 +4529,7 @@ static void check_stmt(CC *cc, ASTNode *n) {
 
 static void crumb_collect_externs(CC *cc) {
     cc->extern_count = 0;
-    cc->extern_cap = 0;
+    cc->extern_cap   = 0;
     cc->extern_names = NULL;
     for (int i = 0; i < cc->program->program.count; i++) {
         ASTNode *item = cc->program->program.items[i];
@@ -4384,7 +4541,7 @@ static void crumb_collect_externs(CC *cc) {
                 memcpy((void *)tmp, cc->extern_names,
                        sizeof(char *) * (size_t)cc->extern_count);
             cc->extern_names = tmp;
-            cc->extern_cap = nc;
+            cc->extern_cap   = nc;
         }
         cc->extern_names[cc->extern_count++] = item->func.name;
     }
@@ -4392,10 +4549,9 @@ static void crumb_collect_externs(CC *cc) {
 
 void crumb_check(ASTNode *program) {
     CC cc = {0};
-    cc.had_error = false;
-    cc.arena = g_arena;
+    cc.arena   = g_arena;
     cc.program = program;
-    cc.scope = NULL;
+    cc.warn_mode = g_cwarn_mode;
 
     crumb_collect_externs(&cc);
     crumb_push(&cc);
@@ -4404,9 +4560,13 @@ void crumb_check(ASTNode *program) {
         ASTNode *item = program->program.items[i];
         switch (item->kind) {
             case ND_GLOBAL_VAR: {
-                bool needs = crumb_needs_ownership_tracking(item->var.type);
-                crumb_declare(&cc, item->var.name, item->var.type, item->line,
-                              needs && !item->var.nomd);
+                bool from_ext = item->var.init &&
+                                crumb_is_extern_call(&cc, item->var.init);
+                bool is_mut   = !item->var.nomd;
+                crumb_declare(&cc, item->var.name, item->var.type,
+                              item->source_path, item->line,
+                              is_heap_backed_type(item->var.type) && is_mut,
+                              from_ext, is_mut);
                 if (item->var.init) check_expr(&cc, item->var.init);
                 break;
             }
@@ -4414,14 +4574,11 @@ void crumb_check(ASTNode *program) {
                 crumb_push(&cc);
                 for (int j = 0; j < item->func.param_count; j++) {
                     Type *pty = item->func.param_types[j];
-                    bool needs = crumb_needs_ownership_tracking(pty);
+                    bool nomd = item->func.param_nomd[j];
                     crumb_declare(&cc, item->func.param_names[j], pty,
-                                  item->line, needs && !item->func.param_nomd[j]);
-                    CrumbInfo *e = crumb_find(&cc, item->func.param_names[j]);
-                    if (e) {
-                        e->warn_unlimited = false;
-                        e->suppress_scope_warn = true;
-                    }
+                                  item->source_path, item->line,
+                                  is_heap_backed_type(pty) && !nomd,
+                                  false, !nomd);
                 }
                 if (item->func.body) check_stmt(&cc, item->func.body);
                 crumb_pop(&cc);
@@ -4922,7 +5079,7 @@ static Type *sem_resolve_named_payload_type(SemCtx *sc, Type *enum_ty,
         return NULL;
     Type *payload = ed->enm.variant_types[variant_index];
     if (!payload) return NULL;
-    if (!enum_ty || enum_ty->kind != TY_ENUM) return payload;
+    if (!enum_ty) return payload;
     if (enum_ty->named.generic_arg_count == 0) return payload;
     if (enum_ty->named.generic_arg_count == 1 && payload->kind == TY_GENERIC)
         return enum_ty->named.generic_args[0];
@@ -5989,7 +6146,7 @@ static const char *cg_type_to_llvm(Codegen *cg, Type *t) {
             strcmp(cg->generic_name, t->generic.param) == 0 &&
             cg->generic_actual)
             return cg_type_to_llvm(cg, cg->generic_actual);
-        return "i64";
+        return "ptr";
     }
     if (t->kind == TY_CONTEXT) {
         if (cg->context_actual) return cg_type_to_llvm(cg, cg->context_actual);
@@ -6339,8 +6496,7 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
         if (t->kind == TY_FLOAT_GENERIC) return resolve_float_type();
         if (t->kind == TY_CONTEXT) {
             if (cg->context_actual) return cg->context_actual;
-            if (cg->cur_ret && cg->cur_ret->kind != TY_CONTEXT)
-                return cg->cur_ret;
+            return t;
         }
         if (t->kind == TY_GENERIC && cg->generic_actual)
             return cg->generic_actual;
@@ -6366,8 +6522,7 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
             if (e->type->kind == TY_FLOAT_GENERIC) return resolve_float_type();
             if (e->type->kind == TY_CONTEXT) {
                 if (cg->context_actual) return cg->context_actual;
-                if (cg->cur_ret && cg->cur_ret->kind != TY_CONTEXT)
-                    return cg->cur_ret;
+                return e->type;
             }
             if (e->type->kind == TY_GENERIC && cg->generic_actual)
                 return cg->generic_actual;
@@ -6390,8 +6545,7 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
                                               cg->generic_actual);
                     if (rt && rt->kind == TY_CONTEXT) {
                         if (cg->context_actual) return cg->context_actual;
-                        if (cg->cur_ret && cg->cur_ret->kind != TY_CONTEXT)
-                            return cg->cur_ret;
+                        return rt;
                     }
                     return rt;
                 }
@@ -7048,6 +7202,17 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             const char *llty = expr_llvm_type(cg, n->binary.lhs);
 
             if (strcmp(llty, "ptr") == 0) {
+                if (n->binary.op == TOK_PLUS) {
+                    int buf_t = new_tmp(cg);
+                    EMITI("%%t%d = alloca [8192 x i8]", buf_t);
+                    int buf_ptr_t = new_tmp(cg);
+                    EMITI("%%t%d = getelementptr inbounds [8192 x i8], ptr %%t%d, i64 0, i64 0",
+                          buf_ptr_t, buf_t);
+                    const char *fmt_ptr = str_ptr(cg, "%s%s");
+                    EMITI("call i32 (ptr, ptr, ...) @sprintf(ptr %%t%d, ptr %s, ptr %s, ptr %s)",
+                          buf_ptr_t, fmt_ptr, lval, rval);
+                    return tmp_name(cg, buf_ptr_t);
+                }
                 int t = new_tmp(cg);
                 bool is_cmp =
                     (n->binary.op == TOK_EQEQ || n->binary.op == TOK_NEQ);
@@ -7310,25 +7475,46 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
 
             if (n->enum_field.arg_count > 0) {
                 ASTNode *argn = n->enum_field.args[0];
-                const char *pval = gen_expr(cg, argn);
-                Type *arg_ty = resolved_expr_type(cg, argn);
                 Type *enum_ty = n->ty;
-                if (!enum_ty && argn)
-                    enum_ty = argn->ty;
                 Type *pt2 = resolve_named_payload_type(cg, enum_ty, ed, tag);
 
+                Type *save_ctx = cg->context_actual;
+                if (pt2) cg->context_actual = pt2;
+                const char *pval_raw = gen_expr(cg, argn);
+                Type *arg_ty = resolved_expr_type(cg, argn);
+                cg->context_actual = save_ctx;
+
                 if (!pt2) pt2 = arg_ty ? arg_ty : make_type(a, TY_VOID);
-                if (arg_ty)
-                    pval = coerce_value(cg, pval, arg_ty, pt2);
-                const char *pty_s = cg_type_to_llvm(cg, pt2);
+                const char *pval = pval_raw;
+                if (arg_ty && arg_ty->kind != TY_CONTEXT &&
+                    !types_equal(arg_ty, pt2))
+                    pval = coerce_value(cg, pval_raw, arg_ty, pt2);
+
+                const char *store_val = pval;
+                if (pt2 && (pt2->kind == TY_STRING || pt2->kind == TY_PTR ||
+                            pt2->kind == TY_GENERIC)) {
+                    const char *pty_s = cg_type_to_llvm(cg, pt2);
+                    int cv = new_tmp(cg);
+                    EMITI("%%t%d = ptrtoint %s %s to i64", cv, pty_s, pval);
+                    store_val = tmp_name(cg, cv);
+                } else if (pt2 && type_is_integer(pt2)) {
+                    const char *pty_s = cg_type_to_llvm(cg, pt2);
+                    if (strcmp(pty_s, "i64") != 0) {
+                        int cv = new_tmp(cg);
+                        const char *ext = type_is_signed(pt2) ? "sext" : "zext";
+                        EMITI("%%t%d = %s %s %s to i64", cv, ext, pty_s, pval);
+                        store_val = tmp_name(cg, cv);
+                    }
+                }
+
                 int pp = new_tmp(cg);
-
                 EMITI(
-                    "%%t%d = getelementptr inbounds %s, ptr %%t%d, i32 0, i32 "
-                    "1",
+                    "%%t%d = getelementptr inbounds %s, ptr %%t%d, i32 0, i32 1",
                     pp, ety, et);
+                EMITI("store i64 %s, ptr %%t%d", store_val, pp);
 
-                EMITI("store %s %s, ptr %%t%d", pty_s, pval, pp);
+                owned_tmp_consume(cg, pval_raw);
+                owned_tmp_consume(cg, pval);
             }
 
             int rt = new_tmp(cg);
@@ -8025,15 +8211,30 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
                     int pp = new_tmp(cg);
                     EMITI(
-                        "%%t%d = getelementptr inbounds %s, ptr %s, i32 0, i32 "
-                        "1",
+                        "%%t%d = getelementptr inbounds %s, ptr %s, i32 0, i32 1",
                         pp, ety, subj_ptr);
+
                     int lp = new_tmp(cg);
-                    EMITI("%%t%d = load %s, ptr %%t%d", lp, pty_s, pp);
+                    EMITI("%%t%d = load i64, ptr %%t%d", lp, pp);
+
+                    const char *typed_val;
+                    if (payload_ty->kind == TY_STRING || payload_ty->kind == TY_PTR ||
+                        payload_ty->kind == TY_GENERIC) {
+                        int cv = new_tmp(cg);
+                        EMITI("%%t%d = inttoptr i64 %%t%d to ptr", cv, lp);
+                        typed_val = tmp_name(cg, cv);
+                    } else if (type_is_integer(payload_ty) &&
+                               strcmp(pty_s, "i64") != 0) {
+                        int cv = new_tmp(cg);
+                        EMITI("%%t%d = trunc i64 %%t%d to %s", cv, lp, pty_s);
+                        typed_val = tmp_name(cg, cv);
+                    } else {
+                        typed_val = tmp_name(cg, lp);
+                    }
 
                     int al = new_tmp(cg);
                     EMITI("%%t%d = alloca %s", al, pty_s);
-                    EMITI("store %s %%t%d, ptr %%t%d", pty_s, lp, al);
+                    EMITI("store %s %s, ptr %%t%d", pty_s, typed_val, al);
                     sym_define(cg, arm->match_arm.bind_name, payload_ty,
                                tmp_name(cg, al), false);
                 }
@@ -8236,8 +8437,8 @@ static void emit_enum_types(Codegen *cg) {
                 if (sz > max_payload) max_payload = sz;
             }
         }
-        fprintf(cg->out, "%%enum.%s = type { i32, [%d x i8] }\n", e->enm.name,
-                max_payload);
+        (void)max_payload;
+        fprintf(cg->out, "%%enum.%s = type { i32, i64 }\n", e->enm.name);
     }
 }
 
