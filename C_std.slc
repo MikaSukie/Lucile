@@ -6,7 +6,7 @@ extern i64tostr(i64 i)    str;
 extern f32tostr(f32 f)    str;
 extern ftostr(f64 f)      str;
 extern btostr(bool b)     str;
-extern tostr(str s)    str;
+extern tostr(str s)       str;
 
 tostring(T candidate) str {
     typeswitch(candidate) {
@@ -40,5 +40,35 @@ input(str s) # {
         typecase(f64)   { return finput(s); }
         typecase(bool)  { return binput(s); }
         typecase(str)   { return sinput(s); }
+    }
+}
+
+unsafe extern charat(i64 id, str search) str;
+
+enum Exist<T> {
+  None;
+  Some(T);
+}
+
+enum Respond<T, E> { 
+    Ok(T);
+    Err(E);
+}
+
+extern read_file(str path) str;
+extern file_exists(str path) bool;
+
+try_read_file(Exist<str> path) Respond<str, str> {
+    match (path) {
+        Some(p) {
+            if (file_exists(p)) {
+                return Respond->Ok(read_file(p));
+            } else {
+                return Respond->Err("Error reading file");
+            }
+        }
+        None {
+            return Respond->Err("No path given");
+        }
     }
 }
