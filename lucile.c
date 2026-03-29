@@ -7539,11 +7539,6 @@ void codegen_run(FILE *out, ASTNode *program, Arena *a) {
     EMIT("; Module Lucile");
     if (cg->target_datalayout)
         EMIT("target datalayout = \"%s\"", cg->target_datalayout);
-    else
-        EMIT(
-            "target datalayout = "
-            "\"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:"
-            "64-S128\"");
     if (cg->target_triple) EMIT("target triple = \"%s\"", cg->target_triple);
     EMIT("");
 
