@@ -1,10 +1,13 @@
 @tdl="e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
 @ttriple="x86_64-pc-linux-gnu";
 
+// the above directives are optional. LLVM will auto fill it in anyway.
+
 import C_std;
 extern puts(str s) void;
 
 main() i32 {
+    nomd i32 z = 7;
     i64 g = 10;
     str t = "bhumi: ";
     str tre = tostring(690);
