@@ -2285,6 +2285,62 @@ static ASTNode *parse_typeswitch(Parser *p) {
     return n;
 }
 
+static bool token_starts_item(TokenType t) {
+    switch (t) {
+        case TOK_RET:
+        case TOK_IF:
+        case TOK_ELSE:
+        case TOK_LOOP:
+        case TOK_MATCH:
+        case TOK_TYPESWITCH:
+        case TOK_BR:
+        case TOK_CONT:
+        case TOK_CRUMBLE:
+        case TOK_DROPALL:
+        case TOK_READONLY:
+        case TOK_WRITEONLY:
+        case TOK_STRUCT:
+        case TOK_PACKED:
+        case TOK_ENUM:
+        case TOK_EXTERN:
+        case TOK_UNSAFE:
+        case TOK_IMPORT:
+        case TOK_IN:
+        case TOK_NOMAIN_DIR:
+        case TOK_NOMD:
+        case TOK_HASH:
+        case TOK_STAR:
+        case TOK_LANGLE:
+        case TOK_VOID_KW:
+        case TOK_BOOL_KW:
+        case TOK_I8:
+        case TOK_I16:
+        case TOK_I32:
+        case TOK_I64:
+        case TOK_U8:
+        case TOK_U16:
+        case TOK_U32:
+        case TOK_U64:
+        case TOK_F32:
+        case TOK_F64:
+        case TOK_STRING_KW:
+        case TOK_CHAR_KW:
+        case TOK_INT_KW:
+        case TOK_FLOAT_KW:
+        case TOK_IDENT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool can_omit_semicolon_after_init(Parser *p, ASTNode *init) {
+    if (!init) return false;
+    if (init->kind != ND_STRUCT_INIT && init->kind != ND_ARRAY_LIT) return false;
+    return p->cur.type == TOK_EOF || p->cur.type == TOK_RBRACE ||
+           token_starts_item(p->cur.type);
+}
+
 static ASTNode *parse_stmt(Parser *p) {
     Arena *a = p->arena;
     int ln = p->cur.line;
@@ -2302,8 +2358,6 @@ static ASTNode *parse_stmt(Parser *p) {
         }
     }
 
-    if (starts_type && !check(p, TOK_IDENT) == false) {
-    }
 
     if (check(p, TOK_RET)) {
         advance_tok(p);
@@ -2421,7 +2475,10 @@ static ASTNode *parse_stmt(Parser *p) {
             if (match_tok(p, TOK_EQ)) {
                 n->var.init = parse_expr(p);
             }
-            stmt_terminator(p);
+            if (!match_tok(p, TOK_SEMICOLON) &&
+                !can_omit_semicolon_after_init(p, n->var.init)) {
+                stmt_terminator(p);
+            }
             return n;
         }
 
@@ -2718,7 +2775,10 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         if (match_tok(p, TOK_EQ)) {
             n->var.init = parse_expr(p);
         }
-        expect(p, TOK_SEMICOLON, ";");
+        if (!match_tok(p, TOK_SEMICOLON) &&
+            !can_omit_semicolon_after_init(p, n->var.init)) {
+            expect(p, TOK_SEMICOLON, ";");
+        }
         return n;
     }
 }
@@ -2933,7 +2993,8 @@ ASTNode *parse_program(Parser *p) {
         if (is_packed) {
             item = parse_func_or_global(p, is_extern, is_unsafe, true);
         } else if (check(p, TOK_STRUCT) || check(p, TOK_ENUM) ||
-                   check(p, TOK_IDENT) || is_type_start(p->cur.type)) {
+                   check(p, TOK_IDENT) || check(p, TOK_NOMD) ||
+                   is_type_start(p->cur.type)) {
             item = parse_func_or_global(p, is_extern, is_unsafe, false);
         } else {
             lc_error(p->cur.line, p->cur.col,
@@ -3437,12 +3498,12 @@ const char *token_type_name(TokenType t) {
             TOK_FALSE) N(TOK_IDENT) N(TOK_RET) N(TOK_IF) N(TOK_ELSE) N(TOK_LOOP)
             N(TOK_STRUCT) N(TOK_PACKED) N(TOK_ENUM) N(TOK_MATCH) N(TOK_EXTERN)
                 N(TOK_UNSAFE) N(TOK_IMPORT) N(TOK_IN) N(TOK_TYPESWITCH) N(
-                    TOK_TYPECASE) N(TOK_FALLBACK) N(TOK_CRUMBLE) N(TOK_DROPALL)
+                    TOK_TYPECASE) N(TOK_FALLBACK) N(TOK_NOMD) N(TOK_CRUMBLE) N(TOK_DROPALL)
                     N(TOK_READONLY) N(TOK_WRITEONLY) N(TOK_BR) N(TOK_CONT) N(
                         TOK_LPAREN) N(TOK_RPAREN) N(TOK_LBRACE) N(TOK_RBRACE)
                         N(TOK_LBRACKET) N(TOK_RBRACKET) N(TOK_SEMICOLON) N(
-                            TOK_COMMA) N(TOK_DOT) N(TOK_ARROW) N(TOK_HASH)
-                            N(TOK_QUESTION) N(TOK_EQ) N(TOK_EQEQ) N(TOK_NEQ) N(
+                            TOK_COMMA) N(TOK_DOT) N(TOK_ARROW) N(TOK_HASH) N(TOK_AT)
+                            N(TOK_QUESTION) N(TOK_COLON) N(TOK_EQ) N(TOK_EQEQ) N(TOK_NEQ) N(
                                 TOK_PLUS) N(TOK_MINUS) N(TOK_STAR) N(TOK_SLASH)
                                 N(TOK_PERCENT) N(TOK_LTE) N(TOK_GTE)
                                     N(TOK_LANGLE) N(TOK_RANGLE) N(TOK_ANDAND)
@@ -3477,6 +3538,7 @@ typedef struct CrumbInfo {
     int reads_used;
     int writes_used;
     int decl_line;
+    bool warn_unlimited;
     struct CrumbInfo *next;
 } CrumbInfo;
 
@@ -3504,6 +3566,7 @@ static void crumb_pop(CC *cc) {
 
     if (!cc->suppress_warn) {
         for (CrumbInfo *e = s->head; e; e = e->next) {
+            if (!e->warn_unlimited) continue;
             if (e->reads_left == -1 && e->reads_used > 0)
                 lc_warn(e->decl_line,
                         "crumb: '%s' had unlimited reads (%d detected); "
@@ -3526,7 +3589,8 @@ static CrumbInfo *crumb_find(CC *cc, const char *name) {
     return NULL;
 }
 
-static void crumb_declare(CC *cc, const char *name, int line) {
+static void crumb_declare(CC *cc, const char *name, int line,
+                           bool warn_unlimited) {
     CrumbInfo *e = arena_alloc(cc->arena, sizeof(CrumbInfo));
     e->name = name;
     e->reads_left = -1;
@@ -3534,6 +3598,7 @@ static void crumb_declare(CC *cc, const char *name, int line) {
     e->reads_used = 0;
     e->writes_used = 0;
     e->decl_line = line;
+    e->warn_unlimited = warn_unlimited;
     e->next = cc->scope->head;
     cc->scope->head = e;
 }
@@ -3653,7 +3718,7 @@ static void check_stmt(CC *cc, ASTNode *n) {
             break;
         case ND_VAR_DECL:
             if (n->var.init) check_expr(cc, n->var.init);
-            crumb_declare(cc, n->var.name, n->line);
+            crumb_declare(cc, n->var.name, n->line, !n->var.nomd);
             break;
         case ND_CRUMBLE:
             crumb_apply(cc, n);
@@ -3683,7 +3748,8 @@ static void check_stmt(CC *cc, ASTNode *n) {
                 crumb_push(cc);
                 ASTNode *arm = n->match.arms[i];
                 if (arm->match_arm.bind_name)
-                    crumb_declare(cc, arm->match_arm.bind_name, arm->line);
+                    crumb_declare(cc, arm->match_arm.bind_name, arm->line,
+                                  false);
                 check_stmt(cc, arm->match_arm.body);
                 crumb_pop(cc);
             }
@@ -3717,14 +3783,16 @@ void crumb_check(ASTNode *program) {
         ASTNode *item = program->program.items[i];
         switch (item->kind) {
             case ND_GLOBAL_VAR:
-                crumb_declare(&cc, item->var.name, item->line);
+                crumb_declare(&cc, item->var.name, item->line,
+                              !item->var.nomd);
                 if (item->var.init) check_expr(&cc, item->var.init);
                 break;
             case ND_FUNC_DECL: {
                 if (item->func.generic_param) break;
                 crumb_push(&cc);
                 for (int j = 0; j < item->func.param_count; j++)
-                    crumb_declare(&cc, item->func.param_names[j], item->line);
+                    crumb_declare(&cc, item->func.param_names[j], item->line,
+                                  false);
                 if (item->func.body) check_stmt(&cc, item->func.body);
                 crumb_pop(&cc);
                 break;
@@ -3738,6 +3806,7 @@ void crumb_check(ASTNode *program) {
     if (cc.had_error) g_errors++;
 }
 
+
 /* ================================================================
    SEMANTIC CHECKER
    - catches duplicate definitions
@@ -3748,6 +3817,7 @@ typedef struct SemEntry {
     const char *name;
     Type *type;
     int line;
+    bool is_nomd;
     struct SemEntry *next;
 } SemEntry;
 
@@ -3847,7 +3917,61 @@ static SemEntry *sem_lookup(SemCtx *sc, const char *name) {
     return NULL;
 }
 
-static void sem_define(SemCtx *sc, const char *name, Type *ty, int line) {
+static bool sem_field_is_nomd(SemCtx *sc, Type *obj_ty, const char *field) {
+    if (!obj_ty) return false;
+    if (obj_ty->kind == TY_PTR && obj_ty->ptr.pointee)
+        obj_ty = obj_ty->ptr.pointee;
+    if (!obj_ty || obj_ty->kind != TY_STRUCT || !field) return false;
+    ASTNode *sd = sem_find_struct(sc->program, obj_ty->named.name);
+    if (!sd) return false;
+    for (int i = 0; i < sd->strct.field_count; i++) {
+        if (strcmp(sd->strct.field_names[i], field) == 0)
+            return sd->strct.field_nomd && sd->strct.field_nomd[i];
+    }
+    return false;
+}
+
+static Type *sem_infer_expr(SemCtx *sc, ASTNode *n);
+
+static bool sem_lvalue_is_nomd(SemCtx *sc, ASTNode *n, const char **name_out,
+                               int *line_out) {
+    if (!n) return false;
+    switch (n->kind) {
+        case ND_IDENT: {
+            SemEntry *e = sem_lookup(sc, n->ident.name);
+            if (!e) return false;
+            if (e->is_nomd) {
+                if (name_out) *name_out = e->name;
+                if (line_out) *line_out = e->line;
+                return true;
+            }
+            return false;
+        }
+        case ND_FIELD: {
+            if (sem_lvalue_is_nomd(sc, n->field.object, name_out, line_out))
+                return true;
+            Type *obj_ty = sem_infer_expr(sc, n->field.object);
+            if (sem_field_is_nomd(sc, obj_ty, n->field.field)) {
+                if (name_out) *name_out = n->field.field;
+                if (line_out) *line_out = n->line;
+                return true;
+            }
+            return false;
+        }
+        case ND_INDEX:
+            return sem_lvalue_is_nomd(sc, n->idx.array, name_out, line_out);
+        case ND_UNARY:
+            if (n->unary.op == TOK_STAR)
+                return sem_lvalue_is_nomd(sc, n->unary.operand, name_out,
+                                          line_out);
+            return false;
+        default:
+            return false;
+    }
+}
+
+static void sem_define(SemCtx *sc, const char *name, Type *ty, int line,
+                       bool is_nomd) {
     if (sem_lookup_local(sc, name)) {
         lc_error_tok_at(sc->source_path, line,
                         source_first_content_col_at(sc->source_path, line),
@@ -3860,6 +3984,7 @@ static void sem_define(SemCtx *sc, const char *name, Type *ty, int line) {
     e->name = name;
     e->type = ty;
     e->line = line;
+    e->is_nomd = is_nomd;
     e->next = sc->scope->entries;
     sc->scope->entries = e;
 }
@@ -4430,7 +4555,7 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                     "unknown type");
                 sc->had_error = true;
             }
-            sem_define(sc, n->var.name, ty, n->line);
+            sem_define(sc, n->var.name, ty, n->line, n->var.nomd);
             if (n->var.init) {
                 Type *it = sem_infer_expr(sc, n->var.init);
                 if (!sem_types_compatible(it, ty)) {
@@ -4443,6 +4568,16 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
             break;
         }
         case ND_ASSIGN: {
+            const char *imm_name = NULL;
+            int imm_line = n->line;
+            if (sem_lvalue_is_nomd(sc, n->assign.lhs, &imm_name, &imm_line)) {
+                lc_error_at(sc->source_path, n->line,
+                            source_first_content_col_at(sc->source_path,
+                                                         n->assign.lhs->line),
+                            "cannot assign to immutable value '%s'", imm_name);
+                sc->had_error = true;
+                break;
+            }
             Type *lt = sem_infer_lvalue(sc, n->assign.lhs);
             if (n->assign.rhs && n->assign.rhs->kind == ND_CALL && lt &&
                 (!n->assign.rhs->ty || n->assign.rhs->ty->kind == TY_CONTEXT))
@@ -4508,7 +4643,7 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                             }
                         }
                     }
-                    sem_define(sc, arm->match_arm.bind_name, bt, arm->line);
+                    sem_define(sc, arm->match_arm.bind_name, bt, arm->line, false);
                 }
                 sem_check_stmt(sc, arm->match_arm.body);
                 sem_pop(sc);
@@ -4556,19 +4691,19 @@ void semantic_check(ASTNode *program) {
                         "unknown type");
                     sc.had_error = true;
                 }
-                sem_define(&sc, it->var.name, ty, it->line);
+                sem_define(&sc, it->var.name, ty, it->line, it->var.nomd);
                 break;
             }
             case ND_STRUCT_DECL: {
                 Type *ty = make_type(sc.arena, TY_STRUCT);
                 ty->named.name = it->strct.name;
-                sem_define(&sc, it->strct.name, ty, it->line);
+                sem_define(&sc, it->strct.name, ty, it->line, false);
                 break;
             }
             case ND_ENUM_DECL: {
                 Type *ty = make_type(sc.arena, TY_ENUM);
                 ty->named.name = it->enm.name;
-                sem_define(&sc, it->enm.name, ty, it->line);
+                sem_define(&sc, it->enm.name, ty, it->line, false);
                 break;
             }
             case ND_FUNC_DECL:
@@ -4605,7 +4740,7 @@ void semantic_check(ASTNode *program) {
                                         ? it->func.ret_type
                                         : make_type(sc.arena, TY_VOID);
                     fty->func.variadic = it->func.variadic;
-                    sem_define(&sc, it->func.name, fty, it->line);
+                    sem_define(&sc, it->func.name, fty, it->line, false);
                 }
                 break;
             }
@@ -4648,7 +4783,8 @@ void semantic_check(ASTNode *program) {
                             it->line);
                     }
                     sem_define(&sc, it->func.param_names[j],
-                               it->func.param_types[j], it->line);
+                               it->func.param_types[j], it->line,
+                               it->func.param_nomd[j]);
                 }
                 if (it->func.ret_type &&
                     !sem_type_known(&sc, it->func.ret_type, sc.cur_generic)) {
@@ -6896,8 +7032,7 @@ void codegen_run(FILE *out, ASTNode *program, Arena *a) {
     emit_pending_specializations(cg);
 
     if (!cg->nomain && !has_main) {
-        lc_error(0, 0,
-                 "no 'main' function found (add @nomain; if intentional)");
+        lc_error(0, 0, "no 'main' function found (add @nomain; if intentional)");
     }
 
     EMIT("");
