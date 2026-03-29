@@ -51,6 +51,7 @@ typedef enum {
     TOK_IF,
     TOK_ELSE,
     TOK_LOOP,
+    TOK_WHILE,
     TOK_STRUCT,
     TOK_PACKED,
     TOK_ENUM,
@@ -300,6 +301,8 @@ typedef struct ASTNode {
 
         struct {
             const char *name;
+            const char **generic_params;
+            int          generic_param_count;
             const char *generic_param;
             const char **variant_names;
             Type **variant_types;
@@ -548,6 +551,7 @@ typedef struct {
     SymScope *scope;
 
     const char **str_pool;
+    bool *str_inline;
     int str_count, str_cap;
 
     const char *cur_func;
@@ -571,6 +575,11 @@ typedef struct {
     ASTNode **in_exts;
     int in_ext_count;
     bool nomain;
+
+    int cur_loop_header;
+    int cur_loop_exit;
+    bool block_terminated;
+    int cur_lbl;
 } Codegen;
 
 void codegen_run(FILE *out, ASTNode *program, Arena *a);
@@ -1295,6 +1304,20 @@ void lc_warn(int line, const char *fmt, ...) {
     va_end(ap);
 }
 
+static bool is_reserved_internal_name(const char *name) {
+    return name && strncmp(name, "__LUCILE__", 10) == 0;
+}
+
+static bool reject_reserved_name(Parser *p, const char *name,
+                                 const char *what) {
+    if (!name || !is_reserved_internal_name(name)) return false;
+    lc_error_tok(p->cur.line, p->cur.col, p->cur.length,
+                 "%s '%s' uses reserved internal prefix '__LUCILE__'",
+                 what, name);
+    p->had_error = true;
+    return true;
+}
+
 /* ================================================================
    AST / TYPE CONSTRUCTORS
    ================================================================ */
@@ -1695,6 +1718,7 @@ static Type *parse_angle_type(Parser *p) {
    ================================================================ */
 
 static ASTNode *parse_expr(Parser *p);
+static ASTNode *parse_unary(Parser *p);
 static ASTNode *parse_block(Parser *p);
 
 typedef enum {
@@ -1796,11 +1820,60 @@ static ASTNode *parse_primary(Parser *p) {
             advance_tok(p);
             Type *target = parse_type(p);
             expect(p, TOK_RPAREN, ")");
-            ASTNode *operand = parse_expr(p);
+            ASTNode *operand = parse_unary(p);
             ASTNode *n = make_node(a, ND_CAST, ln);
             n->cast.target = target;
             n->cast.operand = operand;
             return n;
+        }
+
+        if (pk.type == TOK_IDENT) {
+            int save_pos   = p->lexer->pos;
+            int save_line  = p->lexer->line;
+            int save_col   = p->lexer->col;
+            Token save_peeked    = p->lexer->peeked;
+            bool  save_has_peeked = p->lexer->has_peeked;
+            Token save_cur = p->cur;
+
+            advance_tok(p);
+            const char *maybe_type = p->cur.sval
+                                   ? arena_strdup(a, p->cur.sval) : "?";
+            advance_tok(p);
+
+            int ptr_depth = 0;
+            while (check(p, TOK_STAR)) { advance_tok(p); ptr_depth++; }
+
+            if (check(p, TOK_RPAREN)) {
+                advance_tok(p);
+                TokenType nt = p->cur.type;
+                bool expr_start = nt == TOK_IDENT    || nt == TOK_INT_LIT  ||
+                                  nt == TOK_FLOAT_LIT || nt == TOK_STRING_LIT ||
+                                  nt == TOK_CHAR_LIT  || nt == TOK_TRUE     ||
+                                  nt == TOK_FALSE     || nt == TOK_LPAREN   ||
+                                  nt == TOK_BANG      || nt == TOK_MINUS    ||
+                                  nt == TOK_STAR      || nt == TOK_AMP      ||
+                                  nt == TOK_TILDE     || nt == TOK_LBRACKET;
+                if (expr_start) {
+                    Type *tgt = make_type(a, TY_STRUCT);
+                    tgt->named.name = maybe_type;
+                    for (int pd = 0; pd < ptr_depth; pd++) {
+                        Type *pt = make_type(a, TY_PTR);
+                        pt->ptr.pointee = tgt;
+                        tgt = pt;
+                    }
+                    ASTNode *operand = parse_unary(p);
+                    ASTNode *n = make_node(a, ND_CAST, ln);
+                    n->cast.target = tgt;
+                    n->cast.operand = operand;
+                    return n;
+                }
+            }
+            p->lexer->pos       = save_pos;
+            p->lexer->line      = save_line;
+            p->lexer->col       = save_col;
+            p->lexer->peeked    = save_peeked;
+            p->lexer->has_peeked = save_has_peeked;
+            p->cur = save_cur;
         }
     }
 
@@ -2015,6 +2088,7 @@ static ASTNode *parse_postfix(Parser *p, ASTNode *base) {
             advance_tok(p);
             const char *fname =
                 p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+            reject_reserved_name(p, fname, "field name");
             expect(p, TOK_IDENT, "field name");
             ASTNode *n = make_node(a, ND_FIELD, ln);
             n->field.object = base;
@@ -2156,6 +2230,7 @@ static ASTNode *parse_crumble_stmt(Parser *p) {
     int vc = 0, vcap = 0;
     while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
         const char *vname = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        reject_reserved_name(p, vname, "variable name");
         expect(p, TOK_IDENT, "variable name");
         vars = (const char **)vec_push(a, (void **)vars, &vc, &vcap,
                                        (void *)vname);
@@ -2204,6 +2279,7 @@ static ASTNode *parse_match(Parser *p) {
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
         int aln = p->cur.line;
         const char *variant = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        reject_reserved_name(p, variant, "variant name");
         expect(p, TOK_IDENT, "variant name");
 
         ASTNode *arm = make_node(a, ND_MATCH_ARM, aln);
@@ -2291,6 +2367,7 @@ static bool token_starts_item(TokenType t) {
         case TOK_IF:
         case TOK_ELSE:
         case TOK_LOOP:
+        case TOK_WHILE:
         case TOK_MATCH:
         case TOK_TYPESWITCH:
         case TOK_BR:
@@ -2391,6 +2468,18 @@ static ASTNode *parse_stmt(Parser *p) {
         return n;
     }
 
+    if (check(p, TOK_WHILE)) {
+        advance_tok(p);
+        ASTNode *n = make_node(a, ND_LOOP, ln);
+        n->loop.counter = n->loop.step = NULL;
+        n->loop.cond = NULL;
+        expect(p, TOK_LPAREN, "(");
+        n->loop.cond = parse_expr(p);
+        expect(p, TOK_RPAREN, ")");
+        n->loop.body = parse_block(p);
+        return n;
+    }
+
     if (check(p, TOK_LOOP)) {
         advance_tok(p);
         ASTNode *n = make_node(a, ND_LOOP, ln);
@@ -2413,6 +2502,7 @@ static ASTNode *parse_stmt(Parser *p) {
                     Type *cty = parse_type(p);
                     const char *cname =
                         p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+                    reject_reserved_name(p, cname, "counter name");
                     expect(p, TOK_IDENT, "counter name");
                     ASTNode *cv = make_node(a, ND_VAR_DECL, cln);
                     cv->var.name = cname;
@@ -2467,6 +2557,7 @@ static ASTNode *parse_stmt(Parser *p) {
         const char *vname = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
 
         if (check(p, TOK_IDENT)) {
+            reject_reserved_name(p, vname, "variable name");
             advance_tok(p);
             ASTNode *n = make_node(a, ND_VAR_DECL, ln);
             n->var.name = vname;
@@ -2536,6 +2627,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         if (!is_packed) advance_tok(p);
 
         const char *sname = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        reject_reserved_name(p, sname, "struct name");
         expect(p, TOK_IDENT, "struct name");
         expect(p, TOK_LBRACE, "{");
 
@@ -2588,15 +2680,33 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
     if (check(p, TOK_ENUM)) {
         advance_tok(p);
         const char *ename = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        reject_reserved_name(p, ename, "enum name");
         expect(p, TOK_IDENT, "enum name");
         const char *gparam = NULL;
+        const char **gparams = NULL;
+        int gpc = 0;
         if (check(p, TOK_LANGLE)) {
             advance_tok(p);
+            int gcap = 4;
+            gparams = (const char **)arena_alloc(a, sizeof(void *) * gcap);
             gparam = p->cur.sval ? arena_strdup(a, p->cur.sval) : "T";
+            reject_reserved_name(p, gparam, "generic param");
             expect(p, TOK_IDENT, "generic param");
+            gparams[gpc++] = gparam;
 
             while (match_tok(p, TOK_COMMA)) {
-                advance_tok(p);
+                if (check(p, TOK_RANGLE)) break;
+                const char *gp = p->cur.sval ? arena_strdup(a, p->cur.sval) : "T";
+                reject_reserved_name(p, gp, "generic param");
+                expect(p, TOK_IDENT, "generic param");
+                if (gpc >= gcap) {
+                    int nc = gcap * 2;
+                    const char **ng = (const char **)arena_alloc(a, sizeof(void *) * nc);
+                    memcpy(ng, gparams, sizeof(void *) * (size_t)gpc);
+                    gparams = ng;
+                    gcap = nc;
+                }
+                gparams[gpc++] = gp;
             }
             expect(p, TOK_RANGLE, ">");
         }
@@ -2611,6 +2721,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
             const char *vname =
                 p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+            reject_reserved_name(p, vname, "variant name");
             expect(p, TOK_IDENT, "variant name");
             Type *vtype = NULL;
             if (check(p, TOK_LPAREN)) {
@@ -2639,6 +2750,8 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         ASTNode *n = make_node(a, ND_ENUM_DECL, ln);
         n->enm.name = ename;
         n->enm.generic_param = gparam;
+        n->enm.generic_params = gparams;
+        n->enm.generic_param_count = gpc;
         n->enm.variant_names = vnames;
         n->enm.variant_types = vtypes;
         n->enm.variant_count = vc;
@@ -2649,6 +2762,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         Token pk = lexer_peek(p->lexer);
         if (pk.type == TOK_LPAREN) {
             const char *fname = arena_strdup(a, p->cur.sval);
+            reject_reserved_name(p, fname, "function name");
             advance_tok(p);
             advance_tok(p);
 
@@ -2696,6 +2810,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
                     advance_tok(p);
                     const char *pname =
                         p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+                    reject_reserved_name(p, pname, "parameter name");
                     expect(p, TOK_IDENT, "parameter name");
                     Type *pty = make_type(a, pk2 == TOK_ARGV ? TY_PTR : TY_I32);
                     if (pk2 == TOK_ARGV) {
@@ -2710,8 +2825,10 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
                     Token pk2 = lexer_peek(p->lexer);
                     if (pk2.type == TOK_IDENT) {
                         gparam = arena_strdup(a, p->cur.sval);
+                        reject_reserved_name(p, gparam, "generic parameter");
                         advance_tok(p);
                         const char *pname = arena_strdup(a, p->cur.sval);
+                        reject_reserved_name(p, pname, "parameter name");
                         advance_tok(p);
                         Type *pty = make_type(a, TY_GENERIC);
                         pty->generic.param = gparam;
@@ -2724,6 +2841,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
                 Type *pty = parse_type(p);
                 const char *pname =
                     p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+                reject_reserved_name(p, pname, "parameter name");
                 expect(p, TOK_IDENT, "parameter name");
                 PUSH_PARAM(pname, pty, pnomd);
                 if (!match_tok(p, TOK_COMMA)) break;
@@ -2766,6 +2884,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
         bool gnomd = match_tok(p, TOK_NOMD);
         Type *gtype = parse_type(p);
         const char *gname = p->cur.sval ? arena_strdup(a, p->cur.sval) : "?";
+        reject_reserved_name(p, gname, "variable name");
         expect(p, TOK_IDENT, "variable name");
 
         ASTNode *n = make_node(a, ND_GLOBAL_VAR, ln);
@@ -3031,6 +3150,7 @@ static Keyword keywords[] = {{"ret", TOK_RET},
                              {"if", TOK_IF},
                              {"else", TOK_ELSE},
                              {"loop", TOK_LOOP},
+                             {"while", TOK_WHILE},
                              {"struct", TOK_STRUCT},
                              {"packed", TOK_PACKED},
                              {"enum", TOK_ENUM},
@@ -3202,9 +3322,9 @@ static char parse_escape(Lexer *l) {
         case '"':
             return '"';
         case '{':
-            return '{';
+            return '\x01';
         case '}':
-            return '}';
+            return '\x02';
         default:
             lc_error(l->line, l->col, "unknown escape '\\%c'", c);
             return c;
@@ -3533,12 +3653,17 @@ const char *token_type_name(TokenType t) {
 
 typedef struct CrumbInfo {
     const char *name;
+    Type *type;
     int reads_left;
     int writes_left;
     int reads_used;
     int writes_used;
     int decl_line;
     bool warn_unlimited;
+    bool suppress_scope_warn;
+    bool explicit_drop;
+    bool alive;
+    bool loop_warn_emitted;
     struct CrumbInfo *next;
 } CrumbInfo;
 
@@ -3552,53 +3677,163 @@ typedef struct {
     bool had_error;
     bool suppress_warn;
     Arena *arena;
+    ASTNode *program;
+    const char **extern_names;
+    int extern_count;
+    int extern_cap;
+    int loop_depth;
 } CC;
+
+static bool crumb_type_is_owned(Type *ty) {
+    if (!ty) return false;
+    switch (ty->kind) {
+        case TY_STRING:
+        case TY_PTR:
+        case TY_ARRAY:
+        case TY_STRUCT:
+        case TY_ENUM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool crumb_type_is_scalar(Type *ty) {
+    if (!ty) return false;
+    switch (ty->kind) {
+        case TY_VOID:
+        case TY_BOOL:
+        case TY_I8:
+        case TY_I16:
+        case TY_I32:
+        case TY_I64:
+        case TY_U8:
+        case TY_U16:
+        case TY_U32:
+        case TY_U64:
+        case TY_F32:
+        case TY_F64:
+        case TY_CHAR:
+        case TY_INT_GENERIC:
+        case TY_FLOAT_GENERIC:
+        case TY_CONTEXT:
+        case TY_GENERIC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool crumb_needs_ownership_tracking(Type *ty) {
+    return crumb_type_is_owned(ty) && !crumb_type_is_scalar(ty);
+}
 
 static CrumbScope *crumb_push(CC *cc) {
     CrumbScope *s = arena_alloc(cc->arena, sizeof(CrumbScope));
+    s->head = NULL;
     s->parent = cc->scope;
     cc->scope = s;
     return s;
 }
 
+static CrumbInfo *crumb_scope_find(CrumbScope *s, const char *name) {
+    for (; s; s = s->parent) {
+        for (CrumbInfo *e = s->head; e; e = e->next) {
+            if (strcmp(e->name, name) == 0) return e;
+        }
+    }
+    return NULL;
+}
+
 static void crumb_pop(CC *cc) {
+    if (!cc || !cc->scope) return;
+
     CrumbScope *s = cc->scope;
 
     if (!cc->suppress_warn) {
         for (CrumbInfo *e = s->head; e; e = e->next) {
-            if (!e->warn_unlimited) continue;
-            if (e->reads_left == -1 && e->reads_used > 0)
+            if (!e->alive) continue;
+
+            if (e->warn_unlimited) {
+                if (e->reads_left == -1 && e->reads_used > 0) {
+                    lc_warn(e->decl_line,
+                            "crumb: '%s' had unlimited reads (%d detected); "
+                            "consider crumble(%s)!r=%d",
+                            e->name, e->reads_used, e->name, e->reads_used);
+                }
+                if (e->writes_left == -1 && e->writes_used > 0) {
+                    lc_warn(e->decl_line,
+                            "crumb: '%s' had unlimited writes (%d detected); "
+                            "consider crumble(%s)!w=%d",
+                            e->name, e->writes_used, e->name, e->writes_used);
+                }
+            }
+
+            if (crumb_needs_ownership_tracking(e->type) &&
+                (!e->explicit_drop || e->reads_left != 0 ||
+                 e->writes_left != 0) &&
+                e->reads_used + e->writes_used > 0) {
                 lc_warn(e->decl_line,
-                        "crumb: '%s' had unlimited reads (%d detected); "
-                        "consider crumble(!r=%d)",
-                        e->name, e->reads_used, e->reads_used);
-            if (e->writes_left == -1 && e->writes_used > 0)
+                        "crumb: auto-dropping '%s' at scope end; use dropall(%s)"
+                        " to make the cleanup explicit",
+                        e->name, e->name);
+            }
+
+            if (crumb_needs_ownership_tracking(e->type) &&
+                e->type && (e->type->kind == TY_STRUCT ||
+                            e->type->kind == TY_ENUM) &&
+                e->reads_used + e->writes_used > 0 &&
+                !e->explicit_drop) {
                 lc_warn(e->decl_line,
-                        "crumb: '%s' had unlimited writes (%d detected); "
-                        "consider crumble(!w=%d)",
-                        e->name, e->writes_used, e->writes_used);
+                        "crumb: '%s' is a compound type dropped at scope end; "
+                        "if it owns heap resources, call dropall(%s) and free "
+                        "fields manually to avoid leaks",
+                        e->name, e->name);
+            }
+
+            if (crumb_needs_ownership_tracking(e->type) &&
+                e->reads_used + e->writes_used == 0) {
+                lc_warn(e->decl_line,
+                        "crumb: '%s' was declared but never accessed; "
+                        "possible resource leak",
+                        e->name);
+            }
+
+            e->reads_left = 0;
+            e->writes_left = 0;
+            e->alive = false;
+        }
+    } else {
+        for (CrumbInfo *e = s->head; e; e = e->next) {
+            e->reads_left = 0;
+            e->writes_left = 0;
+            e->alive = false;
         }
     }
+
     cc->scope = s->parent;
 }
 
 static CrumbInfo *crumb_find(CC *cc, const char *name) {
-    for (CrumbScope *s = cc->scope; s; s = s->parent)
-        for (CrumbInfo *e = s->head; e; e = e->next)
-            if (strcmp(e->name, name) == 0) return e;
-    return NULL;
+    if (!cc || !name) return NULL;
+    return crumb_scope_find(cc->scope, name);
 }
 
-static void crumb_declare(CC *cc, const char *name, int line,
+static void crumb_declare(CC *cc, const char *name, Type *ty, int line,
                            bool warn_unlimited) {
+    if (!cc || !cc->scope || !name) return;
     CrumbInfo *e = arena_alloc(cc->arena, sizeof(CrumbInfo));
     e->name = name;
+    e->type = ty;
     e->reads_left = -1;
     e->writes_left = -1;
     e->reads_used = 0;
     e->writes_used = 0;
     e->decl_line = line;
     e->warn_unlimited = warn_unlimited;
+    e->suppress_scope_warn = false;
+    e->explicit_drop = false;
+    e->alive = true;
     e->next = cc->scope->head;
     cc->scope->head = e;
 }
@@ -3613,41 +3848,192 @@ static void crumb_apply(CC *cc, ASTNode *crumble_node) {
             cc->had_error = true;
             continue;
         }
-        if (crumble_node->crumble.read_limit >= 0)
+        if (crumble_node->crumble.read_limit >= 0) {
             e->reads_left = crumble_node->crumble.read_limit;
-        if (crumble_node->crumble.write_limit >= 0)
+            e->warn_unlimited = false;
+        }
+        if (crumble_node->crumble.write_limit >= 0) {
             e->writes_left = crumble_node->crumble.write_limit;
+            e->warn_unlimited = false;
+        }
+        if (crumble_node->crumble.is_dropall) {
+            e->reads_left = 0;
+            e->writes_left = 0;
+            e->explicit_drop = true;
+            e->warn_unlimited = false;
+        }
+        if (crumble_node->crumble.is_readonly) {
+            e->writes_left = 0;
+            e->warn_unlimited = false;
+        }
+        if (crumble_node->crumble.is_writeonly) {
+            e->reads_left = 0;
+            e->warn_unlimited = false;
+        }
     }
+}
+
+static int crumb_ident_col(int line, const char *name) {
+    if (!g_source || !name || !*name || line <= 0) return 1;
+    const char *p = g_source;
+    for (int i = 1; i < line && *p; i++) {
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    if (!*p) return 1;
+    const char *line_start = p;
+    const char *end = p;
+    while (*end && *end != '\n') end++;
+    size_t nlen = strlen(name);
+    const char *hit = p;
+    while (hit < end) {
+        hit = strstr(hit, name);
+        if (!hit || hit >= end) break;
+        bool left_ok = (hit == line_start) ||
+                       (!isalnum((unsigned char)hit[-1]) && hit[-1] != '_');
+        char r = hit[nlen];
+        bool right_ok = (r == '\0') || (!isalnum((unsigned char)r) && r != '_');
+        if (left_ok && right_ok)
+            return (int)(hit - line_start) + 1;
+        hit++;
+    }
+    int col = 1;
+    while (p < end && (*p == ' ' || *p == '\t')) { p++; col++; }
+    return col;
 }
 
 static void crumb_read(CC *cc, const char *name, int line) {
     CrumbInfo *e = crumb_find(cc, name);
     if (!e) return;
+    if (!e->alive) {
+        int col = crumb_ident_col(line, name);
+        lc_error_tok(line, col, (int)strlen(name),
+                     "crumb: '%s' is out of scope", name);
+        cc->had_error = true;
+        return;
+    }
     if (e->reads_left == 0) {
-        lc_error(line, 0, "crumb: '%s' has no reads remaining (exhausted)",
-                 name);
+        int col = crumb_ident_col(line, name);
+        lc_error_tok(line, col, (int)strlen(name),
+                     "crumb: '%s' has no reads remaining (exhausted)", name);
         cc->had_error = true;
         return;
     }
     if (e->reads_left > 0) e->reads_left--;
     e->reads_used++;
+    if (cc->loop_depth > 0 && e->reads_left >= 0 && !e->loop_warn_emitted) {
+        lc_warn(line,
+                "crumb: '%s' has a finite read limit (%d remaining) "
+                "inside a loop — may exhaust before the loop ends",
+                name, e->reads_left);
+        e->loop_warn_emitted = true;
+    }
 }
 
 static void crumb_write(CC *cc, const char *name, int line) {
     CrumbInfo *e = crumb_find(cc, name);
     if (!e) return;
+    if (!e->alive) {
+        int col = crumb_ident_col(line, name);
+        lc_error_tok(line, col, (int)strlen(name),
+                     "crumb: '%s' is out of scope", name);
+        cc->had_error = true;
+        return;
+    }
     if (e->writes_left == 0) {
-        lc_error(line, 0, "crumb: '%s' has no writes remaining (exhausted)",
-                 name);
+        int col = crumb_ident_col(line, name);
+        lc_error_tok(line, col, (int)strlen(name),
+                     "crumb: '%s' has no writes remaining (exhausted)", name);
         cc->had_error = true;
         return;
     }
     if (e->writes_left > 0) e->writes_left--;
     e->writes_used++;
+    if (cc->loop_depth > 0 && e->writes_left >= 0 && !e->loop_warn_emitted) {
+        lc_warn(line,
+                "crumb: '%s' has a finite write limit (%d remaining) "
+                "inside a loop — may exhaust before the loop ends",
+                name, e->writes_left);
+        e->loop_warn_emitted = true;
+    }
+}
+
+static ASTNode *crumb_root_ident(ASTNode *n) {
+    if (!n) return NULL;
+    switch (n->kind) {
+        case ND_IDENT:
+            return n;
+        case ND_FIELD:
+            return crumb_root_ident(n->field.object);
+        case ND_INDEX:
+            return crumb_root_ident(n->idx.array);
+        case ND_UNARY:
+            if (n->unary.op == TOK_STAR) return crumb_root_ident(n->unary.operand);
+            return NULL;
+        default:
+            return NULL;
+    }
 }
 
 static void check_expr(CC *cc, ASTNode *n);
 static void check_stmt(CC *cc, ASTNode *n);
+
+static void crumb_read_lvalue(CC *cc, ASTNode *n) {
+    if (!n) return;
+    switch (n->kind) {
+        case ND_IDENT:
+            crumb_read(cc, n->ident.name, n->line);
+            break;
+        case ND_FIELD:
+            crumb_read_lvalue(cc, n->field.object);
+            break;
+        case ND_INDEX:
+            crumb_read_lvalue(cc, n->idx.array);
+            check_expr(cc, n->idx.index);
+            break;
+        case ND_UNARY:
+            if (n->unary.op == TOK_STAR) {
+                check_expr(cc, n->unary.operand);
+            } else {
+                check_expr(cc, n);
+            }
+            break;
+        default:
+            check_expr(cc, n);
+            break;
+    }
+}
+
+static void crumb_write_lvalue(CC *cc, ASTNode *n) {
+    if (!n) return;
+    switch (n->kind) {
+        case ND_IDENT:
+            crumb_write(cc, n->ident.name, n->line);
+            break;
+        case ND_FIELD:
+            crumb_write_lvalue(cc, n->field.object);
+            break;
+        case ND_INDEX:
+            crumb_read(cc, crumb_root_ident(n) ? crumb_root_ident(n)->ident.name : "?", n->line);
+            check_expr(cc, n->idx.index);
+            crumb_write_lvalue(cc, n->idx.array);
+            break;
+        case ND_UNARY:
+            if (n->unary.op == TOK_STAR) {
+                check_expr(cc, n->unary.operand);
+                ASTNode *root = crumb_root_ident(n->unary.operand);
+                if (root && root->kind == ND_IDENT) {
+                    crumb_write(cc, root->ident.name, n->line);
+                }
+            } else {
+                check_expr(cc, n);
+            }
+            break;
+        default:
+            check_expr(cc, n);
+            break;
+    }
+}
 
 static void check_expr(CC *cc, ASTNode *n) {
     if (!n) return;
@@ -3656,11 +4042,8 @@ static void check_expr(CC *cc, ASTNode *n) {
             crumb_read(cc, n->ident.name, n->line);
             break;
         case ND_ASSIGN:
-
-            if (n->assign.lhs->kind == ND_IDENT)
-                crumb_write(cc, n->assign.lhs->ident.name, n->line);
-            else if (n->assign.lhs->kind == ND_INDEX)
-                check_expr(cc, n->assign.lhs->idx.array);
+            if (n->assign.op != TOK_EQ) crumb_read_lvalue(cc, n->assign.lhs);
+            crumb_write_lvalue(cc, n->assign.lhs);
             check_expr(cc, n->assign.rhs);
             break;
         case ND_BINARY:
@@ -3702,6 +4085,38 @@ static void check_expr(CC *cc, ASTNode *n) {
             for (int i = 0; i < n->struct_init.field_count; i++)
                 check_expr(cc, n->struct_init.field_vals[i]);
             break;
+        case ND_EXPR_STMT:
+            check_expr(cc, n->expr_stmt.expr);
+            break;
+        case ND_FORMAT_STR: {
+            const char *p = n->fmt_str.raw;
+            while (*p) {
+                if (*p != '{') { p++; continue; }
+                if (p[1] == '{') { p += 2; continue; }
+                p++;
+                int depth = 1;
+                while (*p && depth > 0) {
+                    if (*p == '{') { depth++; p++; continue; }
+                    if (*p == '}') {
+                        depth--;
+                        p++;
+                        continue;
+                    }
+                    if (isalpha((unsigned char)*p) || *p == '_') {
+                        char idbuf[256];
+                        int ilen = 0;
+                        while (*p && (isalnum((unsigned char)*p) || *p == '_') &&
+                               ilen < 255)
+                            idbuf[ilen++] = *p++;
+                        idbuf[ilen] = '\0';
+                        crumb_read(cc, idbuf, n->line);
+                    } else {
+                        p++;
+                    }
+                }
+            }
+            break;
+        }
         default:
             break;
     }
@@ -3716,10 +4131,17 @@ static void check_stmt(CC *cc, ASTNode *n) {
                 check_stmt(cc, n->block.stmts[i]);
             crumb_pop(cc);
             break;
-        case ND_VAR_DECL:
+        case ND_VAR_DECL: {
             if (n->var.init) check_expr(cc, n->var.init);
-            crumb_declare(cc, n->var.name, n->line, !n->var.nomd);
+            bool need_tracking = crumb_needs_ownership_tracking(n->var.type);
+            crumb_declare(cc, n->var.name, n->var.type, n->line,
+                          need_tracking && !n->var.nomd);
+            if (n->var.nomd) {
+                CrumbInfo *e = crumb_find(cc, n->var.name);
+                if (e) e->warn_unlimited = false;
+            }
             break;
+        }
         case ND_CRUMBLE:
             crumb_apply(cc, n);
             break;
@@ -3737,9 +4159,11 @@ static void check_stmt(CC *cc, ASTNode *n) {
         case ND_LOOP:
             crumb_push(cc);
             if (n->loop.counter) check_stmt(cc, n->loop.counter);
+            cc->loop_depth++;
             if (n->loop.cond) check_expr(cc, n->loop.cond);
             if (n->loop.step) check_expr(cc, n->loop.step);
             check_stmt(cc, n->loop.body);
+            cc->loop_depth--;
             crumb_pop(cc);
             break;
         case ND_MATCH:
@@ -3747,9 +4171,11 @@ static void check_stmt(CC *cc, ASTNode *n) {
             for (int i = 0; i < n->match.arm_count; i++) {
                 crumb_push(cc);
                 ASTNode *arm = n->match.arms[i];
-                if (arm->match_arm.bind_name)
-                    crumb_declare(cc, arm->match_arm.bind_name, arm->line,
-                                  false);
+                if (arm->match_arm.bind_name) {
+                    Type *bt = n->match.subject ? n->match.subject->ty : NULL;
+                    crumb_declare(cc, arm->match_arm.bind_name, bt, arm->line,
+                                  crumb_needs_ownership_tracking(bt));
+                }
                 check_stmt(cc, arm->match_arm.body);
                 crumb_pop(cc);
             }
@@ -3767,32 +4193,64 @@ static void check_stmt(CC *cc, ASTNode *n) {
             check_expr(cc, n->expr_stmt.expr);
             break;
         default:
+            check_expr(cc, n);
             break;
     }
 }
 
+static void crumb_collect_externs(CC *cc) {
+    cc->extern_count = 0;
+    cc->extern_cap = 0;
+    cc->extern_names = NULL;
+    for (int i = 0; i < cc->program->program.count; i++) {
+        ASTNode *item = cc->program->program.items[i];
+        if (item->kind != ND_EXTERN_DECL) continue;
+        if (cc->extern_count >= cc->extern_cap) {
+            int nc = cc->extern_cap == 0 ? 8 : cc->extern_cap * 2;
+            const char **tmp = arena_alloc(cc->arena, sizeof(char *) * (size_t)nc);
+            if (cc->extern_names)
+                memcpy((void *)tmp, cc->extern_names,
+                       sizeof(char *) * (size_t)cc->extern_count);
+            cc->extern_names = tmp;
+            cc->extern_cap = nc;
+        }
+        cc->extern_names[cc->extern_count++] = item->func.name;
+    }
+}
+
 void crumb_check(ASTNode *program) {
-    CC cc;
+    CC cc = {0};
     cc.had_error = false;
     cc.arena = g_arena;
+    cc.program = program;
     cc.scope = NULL;
 
+    crumb_collect_externs(&cc);
     crumb_push(&cc);
 
     for (int i = 0; i < program->program.count; i++) {
         ASTNode *item = program->program.items[i];
         switch (item->kind) {
-            case ND_GLOBAL_VAR:
-                crumb_declare(&cc, item->var.name, item->line,
-                              !item->var.nomd);
+            case ND_GLOBAL_VAR: {
+                bool needs = crumb_needs_ownership_tracking(item->var.type);
+                crumb_declare(&cc, item->var.name, item->var.type, item->line,
+                              needs && !item->var.nomd);
                 if (item->var.init) check_expr(&cc, item->var.init);
                 break;
+            }
             case ND_FUNC_DECL: {
-                if (item->func.generic_param) break;
                 crumb_push(&cc);
-                for (int j = 0; j < item->func.param_count; j++)
-                    crumb_declare(&cc, item->func.param_names[j], item->line,
-                                  false);
+                for (int j = 0; j < item->func.param_count; j++) {
+                    Type *pty = item->func.param_types[j];
+                    bool needs = crumb_needs_ownership_tracking(pty);
+                    crumb_declare(&cc, item->func.param_names[j], pty,
+                                  item->line, needs && !item->func.param_nomd[j]);
+                    CrumbInfo *e = crumb_find(&cc, item->func.param_names[j]);
+                    if (e) {
+                        e->warn_unlimited = false;
+                        e->suppress_scope_warn = true;
+                    }
+                }
                 if (item->func.body) check_stmt(&cc, item->func.body);
                 crumb_pop(&cc);
                 break;
@@ -3805,7 +4263,6 @@ void crumb_check(ASTNode *program) {
     crumb_pop(&cc);
     if (cc.had_error) g_errors++;
 }
-
 
 /* ================================================================
    SEMANTIC CHECKER
@@ -4853,6 +5310,12 @@ static SymEntry *sym_lookup(Codegen *cg, const char *name) {
 static int new_tmp(Codegen *cg) { return ++cg->tmp; }
 static int new_lbl(Codegen *cg) { return ++cg->lbl; }
 
+#define EMIT_LABEL(id) do { \
+    fprintf(cg->out, "%s:\n", lbl_name(cg, (id))); \
+    cg->block_terminated = false; \
+    cg->cur_lbl = (id); \
+} while(0)
+
 static const char *tmp_name(Codegen *cg, int id) {
     return arena_sprintf(cg->arena, "%%t%d", id);
 }
@@ -4869,13 +5332,18 @@ static const char *intern_string(Codegen *cg, const char *s) {
     if (cg->str_count >= cg->str_cap) {
         int nc = cg->str_cap == 0 ? 16 : cg->str_cap * 2;
         const char **np = arena_alloc(cg->arena, sizeof(char *) * (size_t)nc);
+        bool *ni = arena_alloc(cg->arena, sizeof(bool) * (size_t)nc);
         if (cg->str_pool)
             memcpy(np, cg->str_pool, sizeof(char *) * (size_t)cg->str_count);
+        if (cg->str_inline)
+            memcpy(ni, cg->str_inline, sizeof(bool) * (size_t)cg->str_count);
         cg->str_pool = np;
+        cg->str_inline = ni;
         cg->str_cap = nc;
     }
     int idx = cg->str_count++;
     cg->str_pool[idx] = arena_strdup(cg->arena, s);
+    cg->str_inline[idx] = false;
     return arena_sprintf(cg->arena, "@.str%d", idx);
 }
 
@@ -5105,8 +5573,20 @@ static const char *specialize_context_func(Codegen *cg, ASTNode *fn,
     return sp->name;
 }
 
-#define EMIT(fmt, ...) fprintf(cg->out, fmt "\n", ##__VA_ARGS__)
-#define EMITI(fmt, ...) fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__)
+#define EMIT(fmt, ...) do { \
+    fprintf(cg->out, fmt "\n", ##__VA_ARGS__); \
+    cg->block_terminated = false; \
+} while(0)
+#define EMITI(fmt, ...) do { \
+    if (!cg->block_terminated) \
+        fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+#define EMIT_TERM(fmt, ...) do { \
+    if (!cg->block_terminated) { \
+        fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__); \
+        cg->block_terminated = true; \
+    } \
+} while(0)
 
 static void emit_func(Codegen *cg, ASTNode *fn);
 
@@ -5143,11 +5623,27 @@ static void emit_pending_specializations(Codegen *cg) {
    EMIT HELPERS
    ================================================================ */
 
-#define EMIT(fmt, ...) fprintf(cg->out, fmt "\n", ##__VA_ARGS__)
-#define EMITI(fmt, ...) fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__)
+#define EMIT(fmt, ...) do { \
+    fprintf(cg->out, fmt "\n", ##__VA_ARGS__); \
+    cg->block_terminated = false; \
+} while(0)
+#define EMITI(fmt, ...) do { \
+    if (!cg->block_terminated) \
+        fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__); \
+} while(0)
+#ifndef EMIT_TERM
+#define EMIT_TERM(fmt, ...) do { \
+    if (!cg->block_terminated) { \
+        fprintf(cg->out, "  " fmt "\n", ##__VA_ARGS__); \
+        cg->block_terminated = true; \
+    } \
+} while(0)
+#endif
 
 static void emit_string_consts(Codegen *cg) {
     for (int i = 0; i < cg->str_count; i++) {
+        if (cg->str_inline && cg->str_inline[i]) continue;
+
         const char *s = cg->str_pool[i];
 
         int len = (int)strlen(s) + 1;
@@ -5471,6 +5967,8 @@ static const char *gen_format_str(Codegen *cg, ASTNode *n) {
     int na = 0;
 
     for (const char *p = raw; *p;) {
+        if ((unsigned char)*p == 0x01) { fmt_final[ffi++] = '{'; p++; continue; }
+        if ((unsigned char)*p == 0x02) { fmt_final[ffi++] = '}'; p++; continue; }
         if (*p == '{') {
             if (p[1] == '{') {
                 fmt_final[ffi++] = '{';
@@ -5989,27 +6487,29 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             int false_lbl = new_lbl(cg);
             int merge_lbl = new_lbl(cg);
 
-            EMITI("br i1 %s, label %%%s, label %%%s", cond,
+            EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
                   lbl_name(cg, true_lbl), lbl_name(cg, false_lbl));
 
             Type *ty = n->ternary.then_val->ty ? n->ternary.then_val->ty
                                                : make_type(a, TY_I64);
             const char *llty = type_to_llvm(ty);
 
-            EMIT("%s:", lbl_name(cg, true_lbl));
+            EMIT_LABEL(true_lbl);
             const char *tv = gen_expr(cg, n->ternary.then_val);
-            EMITI("br label %%%s", lbl_name(cg, merge_lbl));
-            int true_end = cg->lbl;
-            (void)true_end;
+            const char *true_end_lbl = lbl_name(cg, cg->cur_lbl);
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
 
-            EMIT("%s:", lbl_name(cg, false_lbl));
+            EMIT_LABEL(false_lbl);
             const char *fv = gen_expr(cg, n->ternary.else_val);
-            EMITI("br label %%%s", lbl_name(cg, merge_lbl));
+            const char *false_end_lbl = lbl_name(cg, cg->cur_lbl);
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
 
-            EMIT("%s:", lbl_name(cg, merge_lbl));
+            EMIT_LABEL(merge_lbl);
             int rt = new_tmp(cg);
             EMITI("%%t%d = phi %s [ %s, %%%s ], [ %s, %%%s ]", rt, llty, tv,
-                  lbl_name(cg, true_lbl), fv, lbl_name(cg, false_lbl));
+                  true_end_lbl, fv, false_end_lbl);
             return tmp_name(cg, rt);
         }
 
@@ -6506,16 +7006,16 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
         case ND_RETURN: {
             Type *ret_ty = cg->cur_ret;
             if (!ret_ty || ret_ty->kind == TY_VOID) {
-                EMITI("ret void");
+                EMIT_TERM("ret void");
             } else if (n->ret.val) {
                 const char *val = gen_expr(cg, n->ret.val);
                 val = coerce_value(cg, val, n->ret.val ? n->ret.val->ty : NULL,
                                    ret_ty);
                 const char *llty = cg_type_to_llvm(cg, ret_ty);
-                EMITI("ret %s %s", llty, val);
+                EMIT_TERM("ret %s %s", llty, val);
             } else {
                 const char *llty = cg_type_to_llvm(cg, ret_ty);
-                EMITI("ret %s %s", llty, zero_init(ret_ty));
+                EMIT_TERM("ret %s %s", llty, zero_init(ret_ty));
             }
             cg->ret_emitted = true;
             break;
@@ -6527,18 +7027,20 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             int else_lbl = new_lbl(cg);
             int merge_lbl = new_lbl(cg);
 
-            EMITI("br i1 %s, label %%%s, label %%%s", cond,
+            EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
                   lbl_name(cg, then_lbl), lbl_name(cg, else_lbl));
 
-            EMIT("%s:", lbl_name(cg, then_lbl));
+            EMIT_LABEL(then_lbl);
             gen_stmt(cg, n->ifstmt.then_body);
-            EMITI("br label %%%s", lbl_name(cg, merge_lbl));
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
 
-            EMIT("%s:", lbl_name(cg, else_lbl));
+            EMIT_LABEL(else_lbl);
             if (n->ifstmt.else_body) gen_stmt(cg, n->ifstmt.else_body);
-            EMITI("br label %%%s", lbl_name(cg, merge_lbl));
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
 
-            EMIT("%s:", lbl_name(cg, merge_lbl));
+            EMIT_LABEL(merge_lbl);
             break;
         }
 
@@ -6547,39 +7049,53 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             int body_lbl = new_lbl(cg);
             int exit_lbl = new_lbl(cg);
 
+            int save_header = cg->cur_loop_header;
+            int save_exit   = cg->cur_loop_exit;
+            cg->cur_loop_header = header_lbl;
+            cg->cur_loop_exit   = exit_lbl;
+
             scope_push(cg);
 
             if (n->loop.counter) gen_stmt(cg, n->loop.counter);
 
-            EMITI("br label %%%s", lbl_name(cg, header_lbl));
-            EMIT("%s:", lbl_name(cg, header_lbl));
+            EMIT_TERM("br label %%%s", lbl_name(cg, header_lbl));
+            EMIT_LABEL(header_lbl);
 
             if (n->loop.cond) {
                 const char *cond = gen_expr(cg, n->loop.cond);
-                EMITI("br i1 %s, label %%%s, label %%%s", cond,
+                EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
                       lbl_name(cg, body_lbl), lbl_name(cg, exit_lbl));
             } else {
-                EMITI("br label %%%s", lbl_name(cg, body_lbl));
+                EMIT_TERM("br label %%%s", lbl_name(cg, body_lbl));
             }
 
-            EMIT("%s:", lbl_name(cg, body_lbl));
+            EMIT_LABEL(body_lbl);
             gen_stmt(cg, n->loop.body);
 
             if (n->loop.step) gen_expr(cg, n->loop.step);
 
-            EMITI("br label %%%s", lbl_name(cg, header_lbl));
-            EMIT("%s:", lbl_name(cg, exit_lbl));
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, header_lbl));
+            EMIT_LABEL(exit_lbl);
             scope_pop(cg);
+
+            cg->cur_loop_header = save_header;
+            cg->cur_loop_exit   = save_exit;
             break;
         }
 
         case ND_BREAK:
-
-            EMITI("br label %%loop_exit  ; br");
+            if (cg->cur_loop_exit)
+                EMIT_TERM("br label %%%s", lbl_name(cg, cg->cur_loop_exit));
+            else
+                lc_error(n->line, 0, "'br' used outside of a loop");
             break;
 
         case ND_CONTINUE:
-            EMITI("br label %%loop_header  ; cont");
+            if (cg->cur_loop_header)
+                EMIT_TERM("br label %%%s", lbl_name(cg, cg->cur_loop_header));
+            else
+                lc_error(n->line, 0, "'cont' used outside of a loop");
             break;
 
         case ND_MATCH: {
@@ -6641,7 +7157,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             fprintf(cg->out, "  ]\n");
 
             for (int i = 0; i < n->match.arm_count; i++) {
-                EMIT("%s:", lbl_name(cg, arm_lbls[i]));
+                EMIT_LABEL(arm_lbls[i]);
                 ASTNode *arm = n->match.arms[i];
                 scope_push(cg);
 
@@ -6679,11 +7195,13 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 }
                 gen_stmt(cg, arm->match_arm.body);
                 scope_pop(cg);
-                EMITI("br label %%%s", lbl_name(cg, merge_lbl));
+                if (!cg->block_terminated)
+                    EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
             }
-            EMIT("%s:", lbl_name(cg, default_lbl));
-            EMITI("br label %%%s", lbl_name(cg, merge_lbl));
-            EMIT("%s:", lbl_name(cg, merge_lbl));
+            EMIT_LABEL(default_lbl);
+            if (!cg->block_terminated)
+                EMIT_TERM("br label %%%s", lbl_name(cg, merge_lbl));
+            EMIT_LABEL(merge_lbl);
             break;
         }
 
@@ -6832,7 +7350,28 @@ static void emit_globals(Codegen *cg) {
             fprintf(cg->out, "%s = global %s %d\n", gname, llty,
                     item->var.init->bool_lit.val ? 1 : 0);
         } else if (item->var.init && item->var.init->kind == ND_STRING_LIT) {
-            fprintf(cg->out, "%s = global %s null\n", gname, llty);
+            const char *s = item->var.init->str_lit.val;
+            int slen = (int)strlen(s) + 1;
+            int sidx = cg->str_count;
+            intern_string(cg, s);
+            fprintf(cg->out,
+                "@.str%d = private unnamed_addr constant [%d x i8] c\"", sidx, slen);
+            for (const char *sc = s; *sc; sc++) {
+                unsigned char uc = (unsigned char)*sc;
+                if      (uc == '\n') fprintf(cg->out, "\\0A");
+                else if (uc == '\t') fprintf(cg->out, "\\09");
+                else if (uc == '\r') fprintf(cg->out, "\\0D");
+                else if (uc == '"')  fprintf(cg->out, "\\22");
+                else if (uc == '\\') fprintf(cg->out, "\\5C");
+                else if (uc < 32 || uc > 126)
+                    fprintf(cg->out, "\\%02X", uc);
+                else fprintf(cg->out, "%c", (char)uc);
+            }
+            fprintf(cg->out, "\\00\"\n");
+            if (cg->str_inline) cg->str_inline[sidx] = true;
+            fprintf(cg->out,
+                "%s = global ptr getelementptr inbounds ([%d x i8], ptr @.str%d, i64 0, i64 0)\n",
+                gname, slen, sidx);
         } else {
             fprintf(cg->out, "%s = global %s zeroinitializer\n", gname, llty);
         }
@@ -6856,6 +7395,8 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
     }
     fprintf(cg->out, ") {\n");
     EMIT("entry:");
+    cg->cur_lbl = 0;
+    cg->block_terminated = false;
 
     const char *save_generic_name = cg->generic_name;
     Type *save_generic_actual = cg->generic_actual;
@@ -6880,11 +7421,11 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
             gen_stmt(cg, fn->func.body->block.stmts[i]);
     }
 
-    if (!cg->ret_emitted) {
+    if (!cg->ret_emitted && !cg->block_terminated) {
         if (ret_ty->kind == TY_VOID)
-            EMITI("ret void");
+            EMIT_TERM("ret void");
         else
-            EMITI("ret %s %s", ret_llvm, zero_init(ret_ty));
+            EMIT_TERM("ret %s %s", ret_llvm, zero_init(ret_ty));
     }
 
     scope_pop(cg);
