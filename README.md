@@ -369,7 +369,9 @@ Marks a value as non modifiable.
     @ttriple="";
     @tdl="";
 
-Disables requirement for main.
+Disables requirement for main,
+Sets the target triple,
+Sets the target data layout.
 
 ---
 
@@ -404,7 +406,7 @@ loop constructs:
     import a, b, c;
     import "path/file.ext";
 
-- Duplicate imports ignored
+- Duplicate imports ignored (recursive imports allowed)
 - Files merged into one unit
 
 ---
