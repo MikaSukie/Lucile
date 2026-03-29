@@ -1,5 +1,5 @@
 CC      := clang
-CFLAGS  := -std=c11 -Wall -Wextra -O2
+CFLAGS  := -std=c17 -Wall -Wextra -O2
 LDFLAGS :=
 
 SRCS    := lucile.c
