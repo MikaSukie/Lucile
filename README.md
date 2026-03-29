@@ -36,7 +36,7 @@ If no return is provided, the zero initializer of the return type is used.
     str hello = "hello!";
     bool TRUE = true;
 
-    Color pink = Color(128, 128, 128, 128);
+    Color pink = Color { r(255); g(50); b(255); a(128); }
 
 - Globals may be uninitialized
 - Uninitialized values are zero initialized
