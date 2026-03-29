@@ -84,7 +84,7 @@ typedef enum {
     TOK_U64,
     TOK_F32,
     TOK_F64,
-    TOK_STRING_KW,
+    TOK_STR_KW,
     TOK_CHAR_KW,
     TOK_BOOL_KW,
     TOK_VOID_KW,
@@ -177,7 +177,7 @@ typedef enum {
     TY_U64,
     TY_F32,
     TY_F64,
-    TY_STRING,
+    TY_STR,
     TY_CHAR,
     TY_ARRAY,
     TY_PTR,
@@ -1645,7 +1645,7 @@ const char *type_to_llvm(Type *t) {
             return "float";
         case TY_F64:
             return "double";
-        case TY_STRING:
+        case TY_STR:
             return "ptr";
         case TY_CHAR:
             return "i8";
@@ -1840,9 +1840,9 @@ static Type *parse_type(Parser *p) {
             advance_tok(p);
             t = make_type(a, TY_F64);
             break;
-        case TOK_STRING_KW:
+        case TOK_STR_KW:
             advance_tok(p);
-            t = make_type(a, TY_STRING);
+            t = make_type(a, TY_STR);
             break;
         case TOK_CHAR_KW:
             advance_tok(p);
@@ -2028,7 +2028,7 @@ static ASTNode *parse_primary(Parser *p) {
         Token pk = lexer_peek(p->lexer);
         bool is_type_kw = (pk.type >= TOK_I8 && pk.type <= TOK_FLOAT_KW) ||
                           pk.type == TOK_VOID_KW || pk.type == TOK_BOOL_KW ||
-                          pk.type == TOK_STRING_KW || pk.type == TOK_CHAR_KW;
+                          pk.type == TOK_STR_KW || pk.type == TOK_CHAR_KW;
         if (is_type_kw) {
             advance_tok(p);
             Type *target = parse_type(p);
@@ -2630,7 +2630,7 @@ static bool token_starts_item(TokenType t) {
         case TOK_U64:
         case TOK_F32:
         case TOK_F64:
-        case TOK_STRING_KW:
+        case TOK_STR_KW:
         case TOK_CHAR_KW:
         case TOK_INT_KW:
         case TOK_FLOAT_KW:
@@ -2656,7 +2656,7 @@ static ASTNode *parse_stmt(Parser *p) {
     bool starts_type =
         is_nomd || (p->cur.type >= TOK_I8 && p->cur.type <= TOK_FLOAT_KW) ||
         p->cur.type == TOK_VOID_KW || p->cur.type == TOK_BOOL_KW ||
-        p->cur.type == TOK_STRING_KW || p->cur.type == TOK_CHAR_KW;
+        p->cur.type == TOK_STR_KW || p->cur.type == TOK_CHAR_KW;
 
     if (!starts_type && check(p, TOK_IDENT)) {
         Token next = lexer_peek(p->lexer);
@@ -2836,7 +2836,7 @@ static bool is_type_start(TokenType t) {
         case TOK_U64:
         case TOK_F32:
         case TOK_F64:
-        case TOK_STRING_KW:
+        case TOK_STR_KW:
         case TOK_CHAR_KW:
         case TOK_INT_KW:
         case TOK_FLOAT_KW:
@@ -3045,7 +3045,7 @@ static ASTNode *parse_func_or_global(Parser *p, bool is_extern, bool is_unsafe,
                     expect(p, TOK_IDENT, "parameter name");
                     Type *pty = make_type(a, pk2 == TOK_ARGV ? TY_PTR : TY_I32);
                     if (pk2 == TOK_ARGV) {
-                        pty->ptr.pointee = make_type(a, TY_STRING);
+                        pty->ptr.pointee = make_type(a, TY_STR);
                     }
                     PUSH_PARAM(pname, pty, false);
                     if (!match_tok(p, TOK_COMMA)) break;
@@ -3420,8 +3420,7 @@ static Keyword keywords[] = {{"ret", TOK_RET},
                              {"u64", TOK_U64},
                              {"f32", TOK_F32},
                              {"f64", TOK_F64},
-                             {"str", TOK_STRING_KW},
-                             {"string", TOK_STRING_KW},
+                             {"str", TOK_STR_KW},
                              {"char", TOK_CHAR_KW},
                              {"bool", TOK_BOOL_KW},
                              {"void", TOK_VOID_KW},
@@ -3956,7 +3955,7 @@ static CrumbInfo *crumb_scope_find(CrumbScope *s, const char *name) {
 static bool is_heap_backed_type(Type *ty) {
     if (!ty) return false;
     switch (ty->kind) {
-        case TY_STRING:
+        case TY_STR:
         case TY_PTR:
             return true;
         case TY_ARRAY:
@@ -4794,7 +4793,7 @@ static bool sem_types_compatible(Type *src, Type *dst) {
         return true;
 
     if (src->kind == TY_PTR && dst->kind == TY_PTR) return true;
-    if (src->kind == TY_STRING && dst->kind == TY_STRING) return true;
+    if (src->kind == TY_STR && dst->kind == TY_STR) return true;
 
     if (src->kind == TY_ARRAY && dst->kind == TY_ARRAY) {
         return src->array.count == dst->array.count &&
@@ -4939,7 +4938,7 @@ static bool sem_type_known(SemCtx *sc, Type *ty, const char *generic_name) {
         case TY_U64:
         case TY_F32:
         case TY_F64:
-        case TY_STRING:
+        case TY_STR:
         case TY_CHAR:
         case TY_INT_GENERIC:
         case TY_FLOAT_GENERIC:
@@ -4970,9 +4969,11 @@ static bool sem_type_known(SemCtx *sc, Type *ty, const char *generic_name) {
 }
 
 static void sem_report_unknown_type(SemCtx *sc, const char *name, int line) {
+    const char *msg = (name && strcmp(name, "string") == 0)
+                         ? "string is not a type"
+                         : "unknown type '%s'";
     lc_error_at(sc->source_path, line,
-                source_ident_col_at(sc->source_path, line, name),
-                "unknown type '%s'", name);
+                source_ident_col_at(sc->source_path, line, name), msg, name);
     sc->had_error = true;
 }
 
@@ -5192,7 +5193,7 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
             break;
         case ND_STRING_LIT:
         case ND_FORMAT_STR:
-            ty = make_type(sc->arena, TY_STRING);
+            ty = make_type(sc->arena, TY_STR);
             break;
         case ND_HASH:
             ty = make_type(sc->arena, TY_CONTEXT);
@@ -5253,16 +5254,16 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
             Type *rt = sem_infer_expr(sc, n->binary.rhs);
             switch (n->binary.op) {
                 case TOK_PLUS:
-                    if ((lt && lt->kind == TY_STRING) ||
-                        (rt && rt->kind == TY_STRING)) {
-                        if (!(lt && lt->kind == TY_STRING && rt &&
-                              rt->kind == TY_STRING)) {
+                    if ((lt && lt->kind == TY_STR) ||
+                        (rt && rt->kind == TY_STR)) {
+                        if (!(lt && lt->kind == TY_STR && rt &&
+                              rt->kind == TY_STR)) {
                             lc_error_at(
                                 sc->source_path, n->line, 0,
                                 "string concatenation requires two strings");
                             sc->had_error = true;
                         }
-                        ty = make_type(sc->arena, TY_STRING);
+                        ty = make_type(sc->arena, TY_STR);
                     } else if (lt && rt && sem_is_num_kind(lt->kind) &&
                                sem_is_num_kind(rt->kind)) {
                         ty = sem_is_float_kind(lt->kind) ||
@@ -5865,7 +5866,7 @@ static SymScope *scope_push(Codegen *cg) {
 }
 
 static bool type_needs_auto_free(Type *ty) {
-    return ty && (ty->kind == TY_PTR || ty->kind == TY_STRING);
+    return ty && (ty->kind == TY_PTR || ty->kind == TY_STR);
 }
 
 static void emit_free_entry(Codegen *cg, SymEntry *e) {
@@ -6474,7 +6475,7 @@ static const char *zero_init(Type *t) {
         case TY_F64:
         case TY_FLOAT_GENERIC:
             return "0.0";
-        case TY_STRING:
+        case TY_STR:
             return "null";
         case TY_CHAR:
             return "0";
@@ -6514,7 +6515,7 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
             return make_type(cg->arena, TY_CHAR);
         case ND_STRING_LIT:
         case ND_FORMAT_STR:
-            return make_type(cg->arena, TY_STRING);
+            return make_type(cg->arena, TY_STR);
         case ND_IDENT: {
             SymEntry *e = sym_lookup(cg, n->ident.name);
             if (!e || !e->type) return make_type(cg->arena, TY_I64);
@@ -6690,7 +6691,7 @@ static Type *interp_expr_type(Codegen *cg, ASTNode *n) {
     switch (n->kind) {
         case ND_STRING_LIT:
         case ND_FORMAT_STR:
-            return make_type(cg->arena, TY_STRING);
+            return make_type(cg->arena, TY_STR);
         case ND_INT_LIT:
             return make_type(cg->arena, TY_INT_GENERIC);
         case ND_FLOAT_LIT:
@@ -6743,8 +6744,8 @@ static Type *interp_expr_type(Codegen *cg, ASTNode *n) {
             }
             Type *lt = interp_expr_type(cg, n->binary.lhs);
             Type *rt = interp_expr_type(cg, n->binary.rhs);
-            if ((lt && lt->kind == TY_STRING) || (rt && rt->kind == TY_STRING))
-                return make_type(cg->arena, TY_STRING);
+            if ((lt && lt->kind == TY_STR) || (rt && rt->kind == TY_STR))
+                return make_type(cg->arena, TY_STR);
             if ((lt && type_is_float(lt)) || (rt && type_is_float(rt)))
                 return make_type(cg->arena, TY_FLOAT_GENERIC);
             return make_type(cg->arena, TY_INT_GENERIC);
@@ -6752,8 +6753,8 @@ static Type *interp_expr_type(Codegen *cg, ASTNode *n) {
         case ND_TERNARY: {
             Type *tt = interp_expr_type(cg, n->ternary.then_val);
             Type *et = interp_expr_type(cg, n->ternary.else_val);
-            if (tt && tt->kind == TY_STRING) return tt;
-            if (et && et->kind == TY_STRING) return et;
+            if (tt && tt->kind == TY_STR) return tt;
+            if (et && et->kind == TY_STR) return et;
             return tt ? tt : et;
         }
         case ND_FIELD: {
@@ -6887,7 +6888,7 @@ static const char *gen_format_str(Codegen *cg, ASTNode *n) {
             const char *aval = gen_expr(cg, expr);
             const char *aty = cg_type_to_llvm(cg, et);
 
-            if (et->kind == TY_STRING) {
+            if (et->kind == TY_STR) {
                 spec = "%s";
                 aty = "ptr";
             } else if (et->kind == TY_BOOL) {
@@ -7053,20 +7054,20 @@ static const char *emit_cast(Codegen *cg, const char *val, Type *src_ty,
         return tmp_name(cg, t);
     }
 
-    if ((src_ty->kind == TY_PTR || src_ty->kind == TY_STRING ||
+    if ((src_ty->kind == TY_PTR || src_ty->kind == TY_STR ||
          src_ty->kind == TY_GENERIC) &&
         type_is_integer(dst_ty)) {
         EMITI("%%t%d = ptrtoint %s %s to %s", t, src_llvm, val, dst_llvm);
         return tmp_name(cg, t);
     }
     if (type_is_integer(src_ty) &&
-        (dst_ty->kind == TY_PTR || dst_ty->kind == TY_STRING ||
+        (dst_ty->kind == TY_PTR || dst_ty->kind == TY_STR ||
          dst_ty->kind == TY_GENERIC)) {
         EMITI("%%t%d = inttoptr %s %s to %s", t, src_llvm, val, dst_llvm);
         return tmp_name(cg, t);
     }
-    if (src_ty->kind == TY_PTR || src_ty->kind == TY_STRING ||
-        dst_ty->kind == TY_PTR || dst_ty->kind == TY_STRING) {
+    if (src_ty->kind == TY_PTR || src_ty->kind == TY_STR ||
+        dst_ty->kind == TY_PTR || dst_ty->kind == TY_STR) {
         EMITI("%%t%d = bitcast %s %s to %s", t, src_llvm, val, dst_llvm);
         return tmp_name(cg, t);
     }
@@ -7111,7 +7112,7 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                 case TY_F64:
                 case TY_FLOAT_GENERIC:
                     return "0.0";
-                case TY_STRING:
+                case TY_STR:
                 case TY_PTR:
                     return "null";
                 default:
@@ -7491,7 +7492,7 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                     pval = coerce_value(cg, pval_raw, arg_ty, pt2);
 
                 const char *store_val = pval;
-                if (pt2 && (pt2->kind == TY_STRING || pt2->kind == TY_PTR ||
+                if (pt2 && (pt2->kind == TY_STR || pt2->kind == TY_PTR ||
                             pt2->kind == TY_GENERIC)) {
                     const char *pty_s = cg_type_to_llvm(cg, pt2);
                     int cv = new_tmp(cg);
@@ -7661,7 +7662,7 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                             ret_ty = clone_type_subst(
                                 cg, fd_for_call->func.ret_type, "#", actual);
                         } else {
-                            ret_ty = make_type(a, TY_STRING);
+                            ret_ty = make_type(a, TY_STR);
                         }
                     }
                 } else {
@@ -8218,7 +8219,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                     EMITI("%%t%d = load i64, ptr %%t%d", lp, pp);
 
                     const char *typed_val;
-                    if (payload_ty->kind == TY_STRING || payload_ty->kind == TY_PTR ||
+                    if (payload_ty->kind == TY_STR || payload_ty->kind == TY_PTR ||
                         payload_ty->kind == TY_GENERIC) {
                         int cv = new_tmp(cg);
                         EMITI("%%t%d = inttoptr i64 %%t%d to ptr", cv, lp);
