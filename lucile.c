@@ -3955,7 +3955,6 @@ static CrumbInfo *crumb_scope_find(CrumbScope *s, const char *name) {
 static bool is_heap_backed_type(Type *ty) {
     if (!ty) return false;
     switch (ty->kind) {
-        case TY_STR:
         case TY_PTR:
             return true;
         case TY_ARRAY:
@@ -4042,7 +4041,8 @@ static void crumb_scope_pop_warnings(CC *cc) {
             continue;
         }
 
-        if (e->reads_used + e->writes_used == 0 && is_heap_backed_type(e->type)) {
+        if (e->reads_used + e->writes_used == 0 && is_heap_backed_type(e->type) &&
+            !e->explicit_drop) {
             crumb_diag_tok(cc, path, e->decl_line, col, toklen,
                            "[CrumbChecker] '%s' was declared but never touched; if it owns heap data, call dropall(%s) before scope end",
                            e->name, e->name);
@@ -5254,16 +5254,12 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
             Type *rt = sem_infer_expr(sc, n->binary.rhs);
             switch (n->binary.op) {
                 case TOK_PLUS:
-                    if ((lt && lt->kind == TY_STR) ||
-                        (rt && rt->kind == TY_STR)) {
-                        if (!(lt && lt->kind == TY_STR && rt &&
-                              rt->kind == TY_STR)) {
-                            lc_error_at(
-                                sc->source_path, n->line, 0,
-                                "string concatenation requires two strings");
-                            sc->had_error = true;
-                        }
-                        ty = make_type(sc->arena, TY_STR);
+                    if ((lt && lt->kind == TY_STR) || (rt && rt->kind == TY_STR)) {
+                        lc_error_at(
+                            sc->source_path, n->line, 0,
+                            "operator '+' does not support strings; use formatting or explicit conversion");
+                        sc->had_error = true;
+                        ty = make_type(sc->arena, TY_VOID);
                     } else if (lt && rt && sem_is_num_kind(lt->kind) &&
                                sem_is_num_kind(rt->kind)) {
                         ty = sem_is_float_kind(lt->kind) ||
@@ -5273,7 +5269,7 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
                     } else {
                         lc_error_at(
                             sc->source_path, n->line, 0,
-                            "operator '+' requires numeric values or strings");
+                            "operator '+' requires numeric values");
                         sc->had_error = true;
                         ty = make_type(sc->arena, TY_VOID);
                     }
@@ -7203,17 +7199,6 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             const char *llty = expr_llvm_type(cg, n->binary.lhs);
 
             if (strcmp(llty, "ptr") == 0) {
-                if (n->binary.op == TOK_PLUS) {
-                    int buf_t = new_tmp(cg);
-                    EMITI("%%t%d = alloca [8192 x i8]", buf_t);
-                    int buf_ptr_t = new_tmp(cg);
-                    EMITI("%%t%d = getelementptr inbounds [8192 x i8], ptr %%t%d, i64 0, i64 0",
-                          buf_ptr_t, buf_t);
-                    const char *fmt_ptr = str_ptr(cg, "%s%s");
-                    EMITI("call i32 (ptr, ptr, ...) @sprintf(ptr %%t%d, ptr %s, ptr %s, ptr %s)",
-                          buf_ptr_t, fmt_ptr, lval, rval);
-                    return tmp_name(cg, buf_ptr_t);
-                }
                 int t = new_tmp(cg);
                 bool is_cmp =
                     (n->binary.op == TOK_EQEQ || n->binary.op == TOK_NEQ);
