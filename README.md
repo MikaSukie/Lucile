@@ -1,448 +1,367 @@
 # Lucile
-Basically BhumiLang if it was in C and also better.
 
-# Lucile Language Spec
+Lucile is a C-like language with structs, enums, generics, contextual typing, a compile-time crumb checker, and LLVM IR output. Imports are merged into the current compilation unit, and duplicate imports are ignored. Diagnostics preserve file paths for imported sources when available. 
 
 ## Overview
 
-Lucile has been inspired by both my Bhumi and Orcat languages.
-They are also inspired by, python, C, rust
-
----
-
-## Entry Point
-
-    main() i32 {
-        return 0;
-    }
-
-Functions do not strictly need to return their declared type.  
-If no return is provided, the zero initializer of the return type is used.
-
----
+Lucile is compiled as a whole unit. The backend emits LLVM IR text. Target datalayout and target triple may be supplied through directives.
 
 ## Comments
 
-- Single line comments use `//`
+- Single-line comments use `//`
 - Block comments use `/* ... */`
 - Nested block comments are supported
 
----
+## Literals
 
-## Variables (Global Scope)
+Supported literals:
 
-    i64 f;
-    str g;
-    str hello = "hello!";
-    bool TRUE = true;
+- Integer literals
+- Floating point literals
+- String literals
+- Character literals
+- `true`
+- `false`
 
-    Color pink = Color { r(255); g(50); b(255); a(128); }
-
-- Globals may be uninitialized
-- Uninitialized values are zero initialized
-
----
-
-## Functions
-
-### Basic function
-
-    test(str f) void {
-    }
-
-### External functions
-
-    extern printf(str fmt,) void;
-
-A leading comma indicates variadic arguments. Only valid for extern declarations.
-
----
-
-## Arrays
-
-    i64[5] arr;
-    arr[1] = 2;
-
-    i64[2] d = [5, 8];
-
-- Fixed size arrays
-- Inline initialization supported
-
----
-
-## Type system notes
-
-- Everything is typed, including expressions
-- Type inference is allowed where possible
-- Default initialization is zero initialization
-
----
-
-## Contextual return types
-
-    input(str s) # {
-        typeswitch(#) {
-            typecase(i64)  { return iinput(s); }
-            typecase(f64)  { return finput(s); }
-            typecase(f32)  { return f32input(s); }
-            typecase(bool) { return binput(s); }
-            typecase(str)  { return sinput(s); }
-        }
-    }
-
-- `#` represents the expected left hand side type
-- Enables contextual polymorphism
-
----
-
-## Generics
-
-    tostring(T candidate) str {
-        typeswitch(T) {
-            typecase(i64) {
-                return i64tostr(candidate);
-            }
-            typecase(f64) {
-                return ftostr(candidate);
-            }
-            typecase(f32) {
-                return f32tostr(candidate);
-            }
-            typecase(bool) {
-                return btostr(candidate);
-            }
-            typecase(str) {
-                return tostr(candidate);
-            }
-        }
-
-        return "tostring error: no matching typecase found";
-    }
-
-### Notes
-
-- Multi parameter generics supported
-- Mangling uses __LUCILE__ prefix
-- __LUCILE__ is reserved
-
----
-
-## Exhaustiveness rules
-
-All typeswitch statements must be exhaustive.
-
-Optional fallback:
-
-    typeswitch(T) {
-        typecase(i64) { }
-        typecase(f64) { }
-        fallback { return "error"; }
-    }
-
-Missing cases are compile errors.
-
----
-
-## Enums
-
-    enum Exist<T> {
-        None;
-        Some(T);
-    }
-
-    enum Respond<T, E> {
-        Ok(T);
-        Err(E);
-    }
-
-Enum access uses:
-
-    EnumName->Field
-
----
-
-## Pattern matching
-
-    try_read_file(Exist<str> path) <Respond<str, str>> {
-        match (path) {
-            Some(p) {
-                if (file_exists(p)) {
-                    return Respond->Ok(read_file(p));
-                } else {
-                    return Respond->Err("Error reading file");
-                }
-            }
-            None {
-                return Respond->Err("No path given");
-            }
-        }
-    }
-
----
-
-## Enum usage
-
-    main() void {
-        Exist<str> thepath = Exist->Some(input("file path?: "));
-
-        match (thepath) {
-            Some(contents) {
-                printnl("path is: " + contents);
-            }
-            None {
-                printnl("Null err");
-            }
-        }
-
-        Respond<str, str> infile = try_read_file(thepath);
-
-        match (infile) {
-            Ok(contents) {
-                printnl(contents);
-            }
-            Err(e) {
-                printnl(e);
-            }
-        }
-    }
-
----
-
-## Ternary operator
-
-    Toggle t = x ? Toggle->On : Toggle->Off;
-
----
-
-## Structs
-
-    struct Rectangle {
-        f32 x;
-        f32 y;
-        f32 width;
-        f32 height;
-    }
-
-    packed struct Color {
-        u8 r;
-        u8 g;
-        u8 b;
-        u8 a;
-    }
-
----
-
-## Operators
-
-### Arithmetic
-    + - * / %
-
-### Assignment
-    = += -= *= /= %=
-
-### Bitwise
-    & | ^ ~ << >>
-
-### Comparison
-    == != > < >= <=
-
-### Logical
-    && || !
-
-### Special
-    *   pointer
-    &   address of
-    .   field access
-    ->  enum field access
-
----
-
-## Casting
-
-    (type) expression
-
-C style casting with standard precedence rules.
-
----
-
-## Strings and interpolation
-
-    "{varname} text {more}"
-
-- Interpolation replaces braces
-- Escape sequences support \{ and \}
-
----
-
-## Struct initialization
-
-    Player p = Player { health(100); ammo(30); }
-
-- Named fields
-- Order independent
-
----
-
-## Crumb system
-
-The crumb system controls read and write permissions and ownership cleanup.
-
-### Syntax
-
-    crumble(var)!r=0!w=0;
-
-- r is read count
-- w is write count
-- omitted values mean unlimited (compiler warns)
-
-### Macros
-
-    dropall(x, y, z);
-    readonly(x, y, z);
-    writeonly(x, y, z);
-
-### Rules
-
-- Multiple readers allowed
-- Only one active writer allowed
-- Writing revokes prior references
-- Stale references must be revalidated
-- A crumbled value becomes unusable after `dropall(...)`
-- When a crumbled value is unusable and its lifetime ends, the compiler emits cleanup/free for the owned value
-- Overwriting an owned pointer value also releases the prior contents before the new value is stored
-- `return`, `break`, `continue`, and normal scope exit must trigger cleanup for live owned crumbled values
-- Compiler tracks usage and enforces limits
-
-### Required usage targets
-
-Crumb declarations are required for:
-
-- Heap strings from extern functions
-- Structs and enums when mutable
-- Raw pointers and references
-- Closures with captures
-- Mutable variables
-
-### Optional usage
-
-- Stack locals
-- Scalars
-- Non mutable variables
-
-### Drop behavior
-
-- Scope based automatic cleanup
----
-
-## Mutability
-
-    nomd
-
-Marks a value as non modifiable.
-
----
-
-## Typecase extension syntax
-
-    in tostring {
-        typecase(int8) for (candidate) {
-            return i8tostr(candidate);
-        }
-    }
-
-- External typecase injection
-- Must remain exhaustive
-
----
-
-## Main arguments
-
-    main(argv a, argc b) i32 {
-        return 0;
-    }
-
-- Argument order does not matter
-- Unused arguments may be omitted
-
----
-
-## Compiler directives
-
-    @nomain;
-    @ttriple="";
-    @tdl="";
-
-Disables requirement for main,
-Sets the target triple,
-Sets the target data layout.
-
----
-
-## Error rules
-
-Compiler errors must include:
-
-- Line numbers
-- Caret indicators
-- Multi character highlights using ~
-- Suggested fixes when possible
-
----
-
-## Loops
-
-loop constructs:
-
-    loop(counter, condition, step) {
-    }
-
-    loop {} // same as while(true) {}
-
-    while (cond) {}
-- br and cont supported
-
----
-
-## Imports
-
-    import file;
-    import a, b, c;
-    import "path/file.ext";
-
-- Duplicate imports ignored (recursive imports allowed)
-- Files merged into one unit
-
----
+String literals that contain `{` are treated as format strings by the compiler. Escape sequences are supported in strings and characters, including `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, `\{`, and `\}`. 
 
 ## Types
 
-- Signed: i8 i16 i32 i64
-- Unsigned: u8 u16 u32 u64
-- Floats: f32 f64
-- Other: bool str char
-- Compound: struct enum
-- Pointers supported
+Built-in types:
 
----
+- `void`
+- `bool`
+- `i8`, `i16`, `i32`, `i64`
+- `u8`, `u16`, `u32`, `u64`
+- `f32`, `f64`
+- `str`
+- `string`
+- `char`
+- `int`
+- `float`
 
-## Unsafe functions
+Compound types:
 
-    unsafe extern func() rettype;
+- Pointer types use a prefix `*`, such as `*i64`
+- Arrays use suffix syntax, such as `i64[5]`
+- Struct and enum types use their declared names
+- Generic type arguments use angle brackets, such as `Result<str, i32>`
 
-- May return stack or heap memory
-- Lifetime not managed by compiler
+`int` and `float` are generic numeric types that may be resolved by the compiler to concrete runtime types during lowering. `#` is the contextual type placeholder.
 
----
+## Variables
 
-## Additional rules
+Variables may be declared at global scope or inside functions.
 
-- Array bounds checking required
-- Hex literals supported
-- Struct fields order independent
-- Pointer arithmetic allowed but safety aware
+```
+i64 count = 0;
+str message = "hello";
+bool ready = true;
+i64[5] values;
+```
 
----
+Uninitialized values are zero-initialized by the compiler. Global variables may omit an initializer. `nomd` marks a binding as non-modifiable.
+
+```
+nomd i64 x = 1;
+i64 nomd y = 2;
+```
+
+## Functions
+
+Basic form:
+
+```
+name(type1 a, type2 b) return_type {
+    return 0;
+}
+```
+
+A function may also use angle-bracket return syntax in contextual cases, for example `name(...) <#> { ... }`. The parser accepts both `ret` and `return` as the return keyword. 
+
+A function may fall through without an explicit return. The compiler handles the missing return during lowering when appropriate. 
+
+### Extern functions
+
+Extern declarations end with `;`.
+
+```
+extern printf(str fmt,) i32;
+```
+
+A trailing comma before `)` marks the function as variadic, and this is only accepted for extern declarations. `unsafe` may prefix an extern declaration.
+
+### Main entry point
+
+A function named `main` is the default entry point. The compiler requires `main` unless `@nomain;` is present.
+
+### Special parameters
+
+`argv` and `argc` are recognized as special parameter forms.
+
+```
+main(argv args, argc count) i32 {
+    return 0;
+}
+```
+
+`argv` is treated as a pointer to string-like values, and `argc` is treated as `i32`.
+
+## Structs
+
+```
+struct Rectangle {
+    f32 x;
+    f32 y;
+    f32 width;
+    f32 height;
+}
+
+packed struct Color {
+    u8 r;
+    u8 g;
+    u8 b;
+    u8 a;
+}
+```
+
+`packed struct` is supported. Struct fields are declared with a type followed by a name and a semicolon. `nomd` may appear on fields.
+
+Struct initialization uses named fields and order is independent.
+
+```
+Rectangle r = Rectangle { x(1); y(2); width(3); height(4); };
+```
+
+## Enums
+
+```
+enum Exist<T> {
+    None;
+    Some(T);
+}
+```
+
+Enums may carry payloads on variants. Generic enums may have multiple generic parameters. Enum construction uses `EnumName->Variant(...)`.
+
+## Expressions
+
+Supported expression forms include:
+
+- Binary operators
+- Unary operators
+- Calls
+- Casts
+- Indexing
+- Field access
+- Ternary expressions
+- Array literals
+- Struct initializers
+- Enum construction
+- String interpolation literals
+
+### Operators
+
+Arithmetic:
+
+- `+ - * / %`
+
+Assignment:
+
+- `= += -= *= /= %=`
+- `&= |= ^= <<= >>=`
+
+Comparison:
+
+- `== != < > <= >=`
+
+Logical:
+
+- `&& || !`
+
+Bitwise:
+
+- `& | ^ ~ << >>`
+
+Special forms:
+
+- `*` for dereference and pointer types
+- `&` for address-of
+- `.` for field access
+- `->` for enum variant construction
+- `? :` for ternary expressions
+
+### Casting
+
+C-style casting is supported:
+
+```
+i64 x = (i64)3.14;
+```
+
+## Arrays
+
+Fixed-size arrays are supported.
+
+```
+i64[5] arr;
+arr[1] = 2;
+
+i64[2] d = [5, 8];
+```
+
+## Control flow
+
+### If
+
+```
+if (cond) {
+    ...
+} else {
+    ...
+}
+```
+
+### While
+
+```
+while (cond) {
+}
+```
+
+### Loop
+
+```
+loop {
+}
+```
+
+Infinite loop form:
+
+```
+loop(counter, cond, step) {
+}
+```
+
+The first slot may be a declaration or an expression. `br` and `cont` are supported for break and continue. `ret` is also accepted as a synonym for `return`.
+
+### Return
+
+```
+return expr;
+```
+
+A bare `return;` is valid where appropriate.
+
+## Pattern matching
+
+### Match
+
+```
+match (value) {
+    Some(x) {
+        ...
+    }
+    None {
+        ...
+    }
+}
+```
+
+### Typeswitch
+
+```
+typeswitch(#) {
+    typecase(i64) {
+        ...
+    }
+    typecase(str) {
+        ...
+    }
+    fallback {
+        ...
+    }
+}
+```
+
+The subject may be `#` or an identifier. `#` refers to the contextual type. `fallback` is optional. The compiler errors if no matching typecase is found and no fallback exists for a concrete type.
+
+## Generics
+
+```
+tostring(T candidate) str {
+    typeswitch(T) {
+        typecase(i64) {
+            return i64tostr(candidate);
+        }
+        typecase(f64) {
+            return ftostr(candidate);
+        }
+        fallback {
+            return "tostring error";
+        }
+    }
+}
+```
+
+The compiler specializes generic functions when they are used. Generated specializations use the reserved `__LUCILE__` prefix. `__LUCILE__` is reserved for compiler-generated names.
+
+Generic type parameters may also appear in enum and type positions. The parser accepts generic parameter names in function parameter lists and generic type arguments after identifiers.
+
+## Contextual return typing
+
+```
+input(str s) # {
+    typeswitch(#) {
+        typecase(i64)  { return iinput(s); }
+        typecase(f64)  { return finput(s); }
+        typecase(f32)  { return f32input(s); }
+        typecase(bool) { return binput(s); }
+        typecase(str)  { return sinput(s); }
+    }
+}
+```
+
+## Imports
+
+```
+import file;
+import a, b, c;
+import "path/file.lc";
+```
+
+Identifier imports are resolved as module names, string imports are resolved relative to the current source file. Duplicate imports are ignored, and recursive imports are allowed.
+
+## Compiler directives
+
+```
+@nomain;
+@tdl="...";
+@ttriple="...";
+@cwarn;
+```
+
+- `@nomain;` disables the requirement for a `main` function
+- `@tdl="...";` sets the LLVM target datalayout
+- `@ttriple="...";` sets the LLVM target triple
+- `@cwarn;` enables crumb diagnostics as warnings instead of hard errors
+
+## Crumb system
+
+```
+crumble(x)!r=0!w=0;
+dropall(x, y, z);
+readonly(x);
+writeonly(x);
+transfer(src, dst);
+```
+
+`crumble` controls read and write limits. Missing `!r` or `!w` means unlimited, and the compiler warns about omitted limits. The checker tracks heap-backed values conservatively. The current compiler treats crumb diagnostics as errors by default unless `@cwarn;` is enabled. The `--no-crumb` flag skips the checker entirely.
+
+## Diagnostics
+
+Compiler diagnostics include file path, line number, a caret marker, and `~` underlines for multi-character spans. Warnings and errors use the same source location style.
 
 ## Backend
 
-Compiles to LLVM IR
+Lucile compiles to LLVM IR.
