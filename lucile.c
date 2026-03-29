@@ -653,6 +653,7 @@ const char *g_source_path = NULL;
 static const char *g_target_datalayout = NULL;
 static const char *g_target_triple = NULL;
 static bool g_cwarn_mode = false;
+static ASTNode *g_crumb_program = NULL;
 
 static char *g_imported_paths[1024];
 static int g_imported_count = 0;
@@ -3952,19 +3953,118 @@ static CrumbInfo *crumb_scope_find(CrumbScope *s, const char *name) {
     return NULL;
 }
 
-static bool is_heap_backed_type(Type *ty) {
+static ASTNode *crumb_find_decl_by_name(NodeKind kind, const char *name) {
+    if (!g_crumb_program || !name) return NULL;
+    for (int i = 0; i < g_crumb_program->program.count; i++) {
+        ASTNode *item = g_crumb_program->program.items[i];
+        if (!item || item->kind != kind) continue;
+        const char *item_name = NULL;
+        if (kind == ND_STRUCT_DECL) item_name = item->strct.name;
+        else if (kind == ND_ENUM_DECL) item_name = item->enm.name;
+        if (item_name && strcmp(item_name, name) == 0) return item;
+    }
+    return NULL;
+}
+
+static bool is_heap_backed_type_impl(Type *ty, const char **seen,
+                                     int seen_count);
+
+static bool heap_name_seen(const char *name, const char **seen, int seen_count) {
+    if (!name || !seen) return false;
+    for (int i = 0; i < seen_count; i++) {
+        if (seen[i] && strcmp(seen[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_heap_backed_type_impl(Type *ty, const char **seen,
+                                     int seen_count) {
     if (!ty) return false;
+
     switch (ty->kind) {
+        case TY_VOID:
+        case TY_BOOL:
+        case TY_I8:
+        case TY_I16:
+        case TY_I32:
+        case TY_I64:
+        case TY_U8:
+        case TY_U16:
+        case TY_U32:
+        case TY_U64:
+        case TY_F32:
+        case TY_F64:
+        case TY_STR:
+        case TY_CHAR:
+        case TY_INT_GENERIC:
+        case TY_FLOAT_GENERIC:
+        case TY_GENERIC:
+        case TY_CONTEXT:
+            return false;
+
         case TY_PTR:
             return true;
+
         case TY_ARRAY:
-            return ty->array.count < 0;
+            return ty->array.count < 0 ||
+                   is_heap_backed_type_impl(ty->array.elem, seen, seen_count);
+
         case TY_STRUCT:
-        case TY_ENUM:
-            return true;
+        case TY_ENUM: {
+            if (ty->named.generic_arg_count > 0) {
+                for (int i = 0; i < ty->named.generic_arg_count; i++) {
+                    if (is_heap_backed_type_impl(ty->named.generic_args[i],
+                                                 seen, seen_count))
+                        return true;
+                }
+            }
+
+            const char *name = ty->named.name;
+            if (!name) return true;
+            if (heap_name_seen(name, seen, seen_count)) return false;
+
+            const char *next_seen[16];
+            int next_count = seen_count < 16 ? seen_count : 16;
+            for (int i = 0; i < next_count; i++) next_seen[i] = seen[i];
+            if (next_count < 16) next_seen[next_count++] = name;
+
+            ASTNode *decl = crumb_find_decl_by_name(
+                ty->kind == TY_STRUCT ? ND_STRUCT_DECL : ND_ENUM_DECL, name);
+            if (!decl) return true;
+
+            if (ty->kind == TY_STRUCT) {
+                for (int i = 0; i < decl->strct.field_count; i++) {
+                    if (is_heap_backed_type_impl(decl->strct.field_types[i],
+                                                 next_seen, next_count))
+                        return true;
+                }
+            } else {
+                for (int i = 0; i < decl->enm.variant_count; i++) {
+                    if (is_heap_backed_type_impl(decl->enm.variant_types[i],
+                                                 next_seen, next_count))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        case TY_FUNC:
+            if (ty->func.param_count > 0) {
+                for (int i = 0; i < ty->func.param_count; i++) {
+                    if (is_heap_backed_type_impl(ty->func.params[i], seen,
+                                                 seen_count))
+                        return true;
+                }
+            }
+            return is_heap_backed_type_impl(ty->func.ret, seen, seen_count);
+
         default:
             return false;
     }
+}
+
+static bool is_heap_backed_type(Type *ty) {
+    return is_heap_backed_type_impl(ty, NULL, 0);
 }
 
 static bool crumb_type_requires_decl(Type *ty, bool from_extern,
@@ -4348,6 +4448,112 @@ static void crumb_mark_passed(CC *cc, ASTNode **args, int argc) {
     }
 }
 
+static void crumb_scan_format_string(CC *cc, const char *raw,
+                                     const char *path, int line) {
+    if (!raw) return;
+
+    const char *p = raw;
+    while (*p) {
+        if ((unsigned char)*p == 0x01 || (unsigned char)*p == 0x02) {
+            p++;
+            continue;
+        }
+        if (*p != '{') {
+            p++;
+            continue;
+        }
+        if (p[1] == '{') {
+            p += 2;
+            continue;
+        }
+
+        p++;
+        int depth = 1;
+        bool in_str = false;
+        bool in_chr = false;
+        bool esc = false;
+        int block_comment = 0;
+        bool line_comment = false;
+
+        while (*p && depth > 0) {
+            char c = *p++;
+
+            if (line_comment) {
+                if (c == '\n') line_comment = false;
+                continue;
+            }
+            if (block_comment > 0) {
+                if (c == '/' && *p == '*') {
+                    p++;
+                    block_comment++;
+                } else if (c == '*' && *p == '/') {
+                    p++;
+                    if (--block_comment == 0) continue;
+                }
+                continue;
+            }
+
+            if (c == '/' && *p == '/') {
+                p++;
+                line_comment = true;
+                continue;
+            }
+            if (c == '/' && *p == '*') {
+                p++;
+                block_comment = 1;
+                continue;
+            }
+
+            if (in_str) {
+                if (esc)
+                    esc = false;
+                else if (c == 92)
+                    esc = true;
+                else if (c == '"')
+                    in_str = false;
+                continue;
+            }
+            if (in_chr) {
+                if (esc)
+                    esc = false;
+                else if (c == 92)
+                    esc = true;
+                else if (c == 39)
+                    in_chr = false;
+                continue;
+            }
+
+            if (c == '"') {
+                in_str = true;
+                continue;
+            }
+            if (c == 39) {
+                in_chr = true;
+                continue;
+            }
+            if (c == '{') {
+                depth++;
+                continue;
+            }
+            if (c == '}') {
+                depth--;
+                continue;
+            }
+            if (isalpha((unsigned char)c) || c == '_') {
+                char idbuf[256];
+                int ilen = 0;
+                idbuf[ilen++] = c;
+                while (*p && (isalnum((unsigned char)*p) || *p == '_') &&
+                       ilen < 255) {
+                    idbuf[ilen++] = *p++;
+                }
+                idbuf[ilen] = '\0';
+                crumb_read(cc, path, idbuf, line);
+            }
+        }
+    }
+}
+
 static void check_expr(CC *cc, ASTNode *n) {
     if (!n) return;
     switch (n->kind) {
@@ -4404,31 +4610,9 @@ static void check_expr(CC *cc, ASTNode *n) {
         case ND_EXPR_STMT:
             check_expr(cc, n->expr_stmt.expr);
             break;
-        case ND_FORMAT_STR: {
-            const char *p = n->fmt_str.raw;
-            while (*p) {
-                if (*p != '{') { p++; continue; }
-                if (p[1] == '{') { p += 2; continue; }
-                p++;
-                int depth = 1;
-                while (*p && depth > 0) {
-                    if (*p == '{') { depth++; p++; continue; }
-                    if (*p == '}') { depth--; p++; continue; }
-                    if (isalpha((unsigned char)*p) || *p == '_') {
-                        char idbuf[256];
-                        int ilen = 0;
-                        while (*p && (isalnum((unsigned char)*p) || *p == '_') &&
-                               ilen < 255)
-                            idbuf[ilen++] = *p++;
-                        idbuf[ilen] = '\0';
-                        crumb_read(cc, n->source_path, idbuf, n->line);
-                    } else {
-                        p++;
-                    }
-                }
-            }
+        case ND_FORMAT_STR:
+            crumb_scan_format_string(cc, n->fmt_str.raw, n->source_path, n->line);
             break;
-        }
         default:
             break;
     }
@@ -4551,6 +4735,7 @@ void crumb_check(ASTNode *program) {
     cc.arena   = g_arena;
     cc.program = program;
     cc.warn_mode = g_cwarn_mode;
+    g_crumb_program = program;
 
     crumb_collect_externs(&cc);
     crumb_push(&cc);
@@ -4589,6 +4774,7 @@ void crumb_check(ASTNode *program) {
     }
 
     crumb_pop(&cc);
+    g_crumb_program = NULL;
     if (cc.had_error) g_errors++;
 }
 
@@ -5127,7 +5313,9 @@ static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n) {
         case ND_INDEX: {
             Type *arr = sem_infer_expr(sc, n->idx.array);
             Type *ix  = sem_infer_expr(sc, n->idx.index);
-            if (!arr || arr->kind != TY_ARRAY) {
+            if (!arr ||
+                !(arr->kind == TY_ARRAY || arr->kind == TY_PTR ||
+                  arr->kind == TY_STR)) {
                 lc_error_at(sc->source_path, n->line, 0,
                             "indexing non-array value");
                 sc->had_error = true;
@@ -5138,8 +5326,8 @@ static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n) {
                             "array index must be an integer");
                 sc->had_error = true;
             }
-            if (n->idx.index && n->idx.index->kind == ND_INT_LIT &&
-                arr->array.count >= 0 &&
+            if (arr->kind == TY_ARRAY && n->idx.index &&
+                n->idx.index->kind == ND_INT_LIT && arr->array.count >= 0 &&
                 (n->idx.index->int_lit.val < 0 ||
                  n->idx.index->int_lit.val >= arr->array.count)) {
                 lc_error_at(sc->source_path, n->line, 0,
@@ -5148,7 +5336,10 @@ static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n) {
                             (long long)arr->array.count);
                 sc->had_error = true;
             }
-            return arr->array.elem;
+            if (arr->kind == TY_ARRAY) return arr->array.elem;
+            if (arr->kind == TY_STR) return make_type(sc->arena, TY_CHAR);
+            return arr->ptr.pointee ? arr->ptr.pointee
+                                    : make_type(sc->arena, TY_VOID);
         }
         case ND_UNARY:
             if (n->unary.op == TOK_STAR) {
@@ -5222,16 +5413,21 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
                 break;
             }
             if (n->unary.op == TOK_AMP) {
+                Type *lt = sem_infer_lvalue(sc, n->unary.operand);
                 ty = make_type(sc->arena, TY_PTR);
-                ty->ptr.pointee = ot;
+                ty->ptr.pointee = lt;
                 break;
             }
             if (n->unary.op == TOK_STAR) {
-                if (!ot || ot->kind != TY_PTR || !ot->ptr.pointee) {
+                if (!ot ||
+                    !((ot->kind == TY_PTR || ot->kind == TY_STR) &&
+                      (ot->kind == TY_STR || ot->ptr.pointee))) {
                     lc_error_at(sc->source_path, n->line, 0,
                                 "dereference of non-pointer value");
                     sc->had_error = true;
                     ty = make_type(sc->arena, TY_VOID);
+                } else if (ot->kind == TY_STR) {
+                    ty = make_type(sc->arena, TY_CHAR);
                 } else {
                     ty = ot->ptr.pointee;
                 }
@@ -6528,6 +6724,12 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
         case ND_CAST:
             return n->cast.target ? n->cast.target
                                   : make_type(cg->arena, TY_VOID);
+        case ND_UNARY:
+            if (n->unary.op == TOK_AMP)
+                return n->ty ? n->ty : make_type(cg->arena, TY_PTR);
+            if (n->unary.op == TOK_STAR)
+                return n->ty ? n->ty : make_type(cg->arena, TY_VOID);
+            return n->ty ? n->ty : make_type(cg->arena, TY_I64);
         case ND_INDEX:
             return n->ty ? n->ty : make_type(cg->arena, TY_VOID);
         case ND_FIELD:
@@ -6584,6 +6786,8 @@ static const char *expr_llvm_type(Codegen *cg, ASTNode *n) {
         }
         case ND_UNARY:
             if (n->unary.op == TOK_AMP) return "ptr";
+            if (n->unary.op == TOK_STAR)
+                return type_to_llvm(resolved_expr_type(cg, n));
             return expr_llvm_type(cg, n->unary.operand);
         case ND_IDENT: {
             Type *t = resolved_expr_type(cg, n);
@@ -6619,19 +6823,12 @@ static void gen_stmt(Codegen *cg, ASTNode *n);
 static const char *emit_cast(Codegen *cg, const char *val, Type *src_ty,
                                 Type *dst_ty);
 
-static const char *emit_array_index_ptr(Codegen *cg, ASTNode *idx_node,
-                                        const char *arr, const char *idx) {
-    if (!idx_node || !idx_node->idx.array || !idx_node->idx.array->ty ||
-        idx_node->idx.array->ty->kind != TY_ARRAY) {
+static const char *emit_index_ptr(Codegen *cg, ASTNode *idx_node,
+                                   const char *base_ptr, Type *base_ty,
+                                   const char *idx) {
+    if (!idx_node || !base_ty) {
         lc_error(idx_node ? idx_node->line : 0, 0,
-                 "array indexing requires a fixed-size array");
-        return "0";
-    }
-
-    Type *arr_ty = idx_node->idx.array->ty;
-    if (arr_ty->array.count < 0) {
-        lc_error(idx_node->line, 0,
-                 "array bounds checking requires a statically sized array");
+                 "indexing requires an array or pointer");
         return "0";
     }
 
@@ -6642,32 +6839,146 @@ static const char *emit_array_index_ptr(Codegen *cg, ASTNode *idx_node,
         idx64 = emit_cast(cg, idx, idx_ty, want);
     }
 
-    int ok_lbl = new_lbl(cg);
-    int fail_lbl = new_lbl(cg);
+    if (base_ty->kind == TY_ARRAY) {
+        if (base_ty->array.count < 0) {
+            lc_error(idx_node->line, 0,
+                     "array bounds checking requires a statically sized array");
+            return "0";
+        }
 
-    int ge = new_tmp(cg);
-    EMITI("%%t%d = icmp sge i64 %s, 0", ge, idx64);
-    int lt = new_tmp(cg);
-    EMITI("%%t%d = icmp slt i64 %s, %lld", lt, idx64,
-          (long long)arr_ty->array.count);
-    int good = new_tmp(cg);
-    EMITI("%%t%d = and i1 %%t%d, %%t%d", good, ge, lt);
-    EMIT_TERM("br i1 %%t%d, label %%%s, label %%%s", good,
-              lbl_name(cg, ok_lbl), lbl_name(cg, fail_lbl));
+        int ok_lbl = new_lbl(cg);
+        int fail_lbl = new_lbl(cg);
 
-    EMIT_LABEL(fail_lbl);
-    EMIT_TERM("call void @llvm.trap()");
-    EMIT_TERM("unreachable");
+        int ge = new_tmp(cg);
+        EMITI("%%t%d = icmp sge i64 %s, 0", ge, idx64);
+        int lt = new_tmp(cg);
+        EMITI("%%t%d = icmp slt i64 %s, %lld", lt, idx64,
+              (long long)base_ty->array.count);
+        int good = new_tmp(cg);
+        EMITI("%%t%d = and i1 %%t%d, %%t%d", good, ge, lt);
+        EMIT_TERM("br i1 %%t%d, label %%%s, label %%%s", good,
+                  lbl_name(cg, ok_lbl), lbl_name(cg, fail_lbl));
 
-    EMIT_LABEL(ok_lbl);
-    const char *arr_ty_str = type_to_llvm(arr_ty);
-    const char *ety = type_to_llvm(arr_ty->array.elem ? arr_ty->array.elem
-                                                      : make_type(cg->arena, TY_I64));
-    int pt = new_tmp(cg);
-    EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
-          pt, arr_ty_str, arr, idx64);
-    (void)ety;
-    return tmp_name(cg, pt);
+        EMIT_LABEL(fail_lbl);
+        EMIT_TERM("call void @llvm.trap()");
+        EMIT_TERM("unreachable");
+
+        EMIT_LABEL(ok_lbl);
+        const char *arr_ty_str = type_to_llvm(base_ty);
+        int pt = new_tmp(cg);
+        EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
+              pt, arr_ty_str, base_ptr, idx64);
+        return tmp_name(cg, pt);
+    }
+
+    if ((base_ty->kind == TY_PTR || base_ty->kind == TY_STR) &&
+        (base_ty->kind == TY_STR || base_ty->ptr.pointee)) {
+        Type *elem_ty = (base_ty->kind == TY_STR) ? make_type(cg->arena, TY_I8)
+                                                  : base_ty->ptr.pointee;
+        if (elem_ty && elem_ty->kind == TY_ARRAY) {
+            const char *arr_ty_str = type_to_llvm(elem_ty);
+            int pt = new_tmp(cg);
+            EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
+                  pt, arr_ty_str, base_ptr, idx64);
+            return tmp_name(cg, pt);
+        }
+        const char *elem_llvm = type_to_llvm(elem_ty ? elem_ty : make_type(cg->arena, TY_I8));
+        int pt = new_tmp(cg);
+        EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 %s",
+              pt, elem_llvm, base_ptr, idx64);
+        return tmp_name(cg, pt);
+    }
+
+    lc_error(idx_node->line, 0, "indexing requires an array or pointer");
+    return "0";
+}
+
+static const char *emit_lvalue_ptr(Codegen *cg, ASTNode *n) {
+    if (!n) {
+        lc_error(0, 0, "expression is not addressable");
+        return "0";
+    }
+
+    switch (n->kind) {
+        case ND_IDENT: {
+            SymEntry *e = sym_lookup(cg, n->ident.name);
+            if (!e) {
+                lc_error(n->line, 0, "undefined variable '%s'", n->ident.name);
+                return "0";
+            }
+            return e->llvm_name;
+        }
+
+        case ND_FIELD: {
+            Type *obj_ty = resolved_expr_type(cg, n->field.object);
+            const char *obj_ptr = NULL;
+
+            if (obj_ty && obj_ty->kind == TY_PTR && obj_ty->ptr.pointee) {
+                obj_ptr = gen_expr(cg, n->field.object);
+                obj_ty = obj_ty->ptr.pointee;
+            } else {
+                obj_ptr = emit_lvalue_ptr(cg, n->field.object);
+            }
+
+            if (!obj_ptr || !obj_ty || obj_ty->kind != TY_STRUCT) {
+                lc_error(n->line, 0,
+                         "cannot take address of expression for field access");
+                return "0";
+            }
+
+            ASTNode *sd = find_struct(cg, obj_ty->named.name);
+            if (!sd) {
+                lc_error(n->line, 0, "struct '%s' not found",
+                         obj_ty->named.name);
+                return "0";
+            }
+
+            int fidx = -1;
+            for (int i = 0; i < sd->strct.field_count; i++)
+                if (strcmp(sd->strct.field_names[i], n->field.field) == 0) {
+                    fidx = i;
+                    break;
+                }
+            if (fidx < 0) {
+                lc_error(n->line, 0, "no field '%s' in struct '%s'",
+                         n->field.field, obj_ty->named.name);
+                return "0";
+            }
+
+            const char *sllty = type_to_llvm(obj_ty);
+            int pt = new_tmp(cg);
+            EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i32 0, i32 %d",
+                  pt, sllty, obj_ptr, fidx);
+            return tmp_name(cg, pt);
+        }
+
+        case ND_INDEX: {
+            Type *base_ty = resolved_expr_type(cg, n->idx.array);
+            const char *base_ptr = NULL;
+
+            if (base_ty && base_ty->kind == TY_PTR && base_ty->ptr.pointee) {
+                base_ptr = gen_expr(cg, n->idx.array);
+                base_ty = base_ty->ptr.pointee;
+            } else if (base_ty && base_ty->kind == TY_STR) {
+                base_ptr = gen_expr(cg, n->idx.array);
+            } else {
+                base_ptr = emit_lvalue_ptr(cg, n->idx.array);
+            }
+
+            const char *idx = gen_expr(cg, n->idx.index);
+            return emit_index_ptr(cg, n, base_ptr, base_ty, idx);
+        }
+
+        case ND_UNARY:
+            if (n->unary.op == TOK_STAR)
+                return gen_expr(cg, n->unary.operand);
+            break;
+        default:
+            break;
+    }
+
+    lc_error(n->line, 0, "expression is not addressable");
+    return "0";
 }
 
 static ASTNode *parse_interp_expr(Codegen *cg, const char *src, int line) {
@@ -6814,11 +7125,28 @@ static const char *gen_format_str(Codegen *cg, ASTNode *n) {
 
             while (*p && depth > 0) {
                 char c = *p++;
+
+                if (c == 0x01 || c == 0x02) {
+                    const char esc_brace = (c == 0x01) ? '{' : '}';
+                    if (ei < (int)sizeof(expr_buf) - 2) {
+                        expr_buf[ei++] = 92;
+                        expr_buf[ei++] = esc_brace;
+                    } else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
+                    continue;
+                }
+
                 if (in_str) {
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     if (esc)
                         esc = false;
-                    else if (c == '\\')
+                    else if (c == 92)
                         esc = true;
                     else if (c == '"')
                         in_str = false;
@@ -6826,33 +7154,74 @@ static const char *gen_format_str(Codegen *cg, ASTNode *n) {
                 }
                 if (in_chr) {
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     if (esc)
                         esc = false;
-                    else if (c == '\\')
+                    else if (c == 92)
                         esc = true;
-                    else if (c == '\'')
+                    else if (c == 39)
                         in_chr = false;
                     continue;
                 }
+
+                if (c == '/' && *p == '/') {
+                    while (*p && *p != 10) p++;
+                    continue;
+                }
+                if (c == '/' && *p == '*') {
+                    int cdepth = 1;
+                    p++;
+                    while (*p && cdepth > 0) {
+                        char d = *p++;
+                        if (d == '/' && *p == '*') {
+                            p++;
+                            cdepth++;
+                        } else if (d == '*' && *p == '/') {
+                            p++;
+                            cdepth--;
+                        }
+                    }
+                    continue;
+                }
+
                 if (c == '"') {
                     in_str = true;
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     continue;
                 }
-                if (c == '\'') {
+                if (c == 39) {
                     in_chr = true;
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     continue;
                 }
                 if (c == '{') {
                     depth++;
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     continue;
                 }
                 if (c == '}') {
                     depth--;
                     if (depth == 0) break;
                     if (ei < (int)sizeof(expr_buf) - 1) expr_buf[ei++] = c;
+                    else {
+                        lc_error(n->line, 0, "interpolation expression too long");
+                        return str_ptr(cg, "");
+                    }
                     continue;
                 }
                 if (ei < (int)sizeof(expr_buf) - 1)
@@ -6862,7 +7231,7 @@ static const char *gen_format_str(Codegen *cg, ASTNode *n) {
                     return str_ptr(cg, "");
                 }
             }
-            expr_buf[ei] = '\0';
+            expr_buf[ei] = 0;
 
             char *trim = expr_buf;
             while (isspace((unsigned char)*trim)) trim++;
@@ -7161,8 +7530,9 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
         case ND_UNARY: {
             const char *operand = gen_expr(cg, n->unary.operand);
 
-            Type *ty = n->unary.operand->ty ? n->unary.operand->ty
-                                            : make_type(a, TY_I64);
+            Type *ty = resolved_expr_type(cg, n);
+            if (!ty) ty = n->unary.operand->ty ? n->unary.operand->ty
+                                               : make_type(a, TY_I64);
             const char *llty = type_to_llvm(ty);
             int t = new_tmp(cg);
             switch (n->unary.op) {
@@ -7183,7 +7553,7 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                     break;
                 }
                 case TOK_AMP: {
-                    return operand;
+                    return emit_lvalue_ptr(cg, n->unary.operand);
                 }
                 default:
                     EMITI("%%t%d = add i64 0, %s", t, operand);
@@ -7347,49 +7717,56 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
         }
 
         case ND_INDEX: {
-            const char *arr = gen_expr(cg, n->idx.array);
             const char *idx = gen_expr(cg, n->idx.index);
+            Type *base_ty = resolved_expr_type(cg, n->idx.array);
+            const char *base_ptr = NULL;
 
-            Type *arr_ty = n->idx.array->ty;
-            if (!arr_ty || arr_ty->kind != TY_ARRAY) {
-                lc_error(n->line, 0, "array indexing requires an array");
+            if (base_ty && base_ty->kind == TY_PTR && base_ty->ptr.pointee) {
+                base_ptr = gen_expr(cg, n->idx.array);
+                base_ty = base_ty->ptr.pointee;
+            } else if (base_ty && base_ty->kind == TY_STR) {
+                base_ptr = gen_expr(cg, n->idx.array);
+            } else {
+                base_ptr = emit_lvalue_ptr(cg, n->idx.array);
+            }
+
+            if (!base_ty ||
+                !(base_ty->kind == TY_ARRAY || base_ty->kind == TY_PTR ||
+                  base_ty->kind == TY_STR)) {
+                lc_error(n->line, 0, "array indexing requires an array or pointer");
                 return "0";
             }
-            const char *ptr = emit_array_index_ptr(cg, n, arr, idx);
-            Type *elem_ty = arr_ty->array.elem ? arr_ty->array.elem
-                                               : make_type(a, TY_I64);
+
+            const char *ptr = emit_index_ptr(cg, n, base_ptr, base_ty, idx);
+            Type *elem_ty = NULL;
+            if (base_ty->kind == TY_ARRAY)
+                elem_ty = base_ty->array.elem;
+            else if (base_ty->kind == TY_STR)
+                elem_ty = make_type(a, TY_I8);
+            else
+                elem_ty = base_ty->ptr.pointee;
+            if (!elem_ty) elem_ty = make_type(a, TY_I64);
             int rt = new_tmp(cg);
             EMITI("%%t%d = load %s, ptr %s", rt, type_to_llvm(elem_ty), ptr);
             return tmp_name(cg, rt);
         }
 
         case ND_FIELD: {
-            (void)gen_expr(cg, n->field.object);
-            Type *obj_ty = n->field.object->ty;
+            Type *obj_ty = resolved_expr_type(cg, n->field.object);
+            const char *obj_ptr = NULL;
 
-            if (!obj_ty && n->field.object->kind == ND_IDENT) {
-                SymEntry *e = sym_lookup(cg, n->field.object->ident.name);
-                if (e) obj_ty = e->type;
-            }
-
-            if (obj_ty && obj_ty->kind == TY_PTR && obj_ty->ptr.pointee)
+            if (obj_ty && obj_ty->kind == TY_PTR && obj_ty->ptr.pointee) {
+                obj_ptr = gen_expr(cg, n->field.object);
                 obj_ty = obj_ty->ptr.pointee;
-
-            if (!obj_ty || obj_ty->kind != TY_STRUCT) {
-                if (n->field.object->kind == ND_IDENT) {
-                    const char *vname = n->field.object->ident.name;
-                    SymEntry *e = sym_lookup(cg, vname);
-                    if (e && e->type && e->type->kind == TY_STRUCT) {
-                        obj_ty = e->type;
-                    } else {
-                        lc_error(n->line, 0, "field access on non-struct type");
-                        return "0";
-                    }
-                } else {
-                    lc_error(n->line, 0, "field access on non-struct type");
-                    return "0";
-                }
+            } else {
+                obj_ptr = emit_lvalue_ptr(cg, n->field.object);
             }
+
+            if (!obj_ty || obj_ty->kind != TY_STRUCT || !obj_ptr) {
+                lc_error(n->line, 0, "field access on non-struct type");
+                return "0";
+            }
+
             ASTNode *sd = find_struct(cg, obj_ty->named.name);
             if (!sd) {
                 lc_error(n->line, 0, "struct '%s' not found",
@@ -7408,22 +7785,10 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                 return "0";
             }
             Type *fty = sd->strct.field_types[fidx];
-            const char *sllty = type_to_llvm(obj_ty);
             const char *fllty = type_to_llvm(fty);
             int pt = new_tmp(cg);
-
-            const char *obj_ptr = NULL;
-            if (n->field.object->kind == ND_IDENT) {
-                SymEntry *e = sym_lookup(cg, n->field.object->ident.name);
-                if (e) obj_ptr = e->llvm_name;
-            }
-            if (!obj_ptr) {
-                lc_error(n->line, 0,
-                         "cannot take address of expression for field access");
-                return "0";
-            }
             EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i32 0, i32 %d",
-                  pt, sllty, obj_ptr, fidx);
+                  pt, type_to_llvm(obj_ty), obj_ptr, fidx);
             int rt = new_tmp(cg);
             EMITI("%%t%d = load %s, ptr %%t%d", rt, fllty, pt);
             return tmp_name(cg, rt);
@@ -7740,79 +8105,99 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             const char *rval_raw = gen_expr(cg, n->assign.rhs);
             const char *rval = coerce_value(cg, rval_raw, rhs_ty, lhs_ty);
             const char *llty = type_to_llvm(lhs_ty);
+            const char *store_ptr = NULL;
 
             if (n->assign.op != TOK_EQ) {
-                const char *lval = gen_expr(cg, n->assign.lhs);
-                lval = coerce_value(cg, lval, lhs_ty, lhs_ty);
+                const char *lval = NULL;
+                if (n->assign.lhs->kind == ND_IDENT) {
+                    SymEntry *e = sym_lookup(cg, n->assign.lhs->ident.name);
+                    if (!e) {
+                        lc_error(n->line, 0, "undefined variable '%s'",
+                                 n->assign.lhs->ident.name);
+                        return rval;
+                    }
+                    store_ptr = e->llvm_name;
+                    int lt = new_tmp(cg);
+                    EMITI("%%t%d = load %s, ptr %s", lt, llty, store_ptr);
+                    lval = tmp_name(cg, lt);
+                } else {
+                    store_ptr = emit_lvalue_ptr(cg, n->assign.lhs);
+                    if (!store_ptr || strcmp(store_ptr, "0") == 0) {
+                        owned_tmp_consume(cg, rval_raw);
+                        owned_tmp_consume(cg, rval);
+                        return rval;
+                    }
+                    int lt = new_tmp(cg);
+                    EMITI("%%t%d = load %s, ptr %s", lt, llty, store_ptr);
+                    lval = tmp_name(cg, lt);
+                }
+
                 const char *op = NULL;
                 bool fp = type_is_float(lhs_ty);
                 bool sg = type_is_signed(lhs_ty);
                 int ct = new_tmp(cg);
                 switch (n->assign.op) {
-                    case TOK_PLUSEQ:
-                        op = fp ? "fadd" : "add";
-                        break;
-                    case TOK_MINUSEQ:
-                        op = fp ? "fsub" : "sub";
-                        break;
-                    case TOK_STAREQ:
-                        op = fp ? "fmul" : "mul";
-                        break;
-                    case TOK_SLASHEQ:
-                        op = fp ? "fdiv" : (sg ? "sdiv" : "udiv");
-                        break;
-                    case TOK_PERCENTEQ:
-                        op = sg ? "srem" : "urem";
-                        break;
-                    case TOK_AMPEQ:
-                        op = "and";
-                        break;
-                    case TOK_PIPEEQ:
-                        op = "or";
-                        break;
-                    case TOK_CARETEQ:
-                        op = "xor";
-                        break;
-                    case TOK_LSHIFTEQ:
-                        op = "shl";
-                        break;
-                    case TOK_RSHIFTEQ:
-                        op = sg ? "ashr" : "lshr";
-                        break;
-                    default:
-                        op = "add";
-                        break;
+                    case TOK_PLUSEQ: op = fp ? "fadd" : "add"; break;
+                    case TOK_MINUSEQ: op = fp ? "fsub" : "sub"; break;
+                    case TOK_STAREQ: op = fp ? "fmul" : "mul"; break;
+                    case TOK_SLASHEQ: op = fp ? "fdiv" : (sg ? "sdiv" : "udiv"); break;
+                    case TOK_PERCENTEQ: op = sg ? "srem" : "urem"; break;
+                    case TOK_AMPEQ: op = "and"; break;
+                    case TOK_PIPEEQ: op = "or"; break;
+                    case TOK_CARETEQ: op = "xor"; break;
+                    case TOK_LSHIFTEQ: op = "shl"; break;
+                    case TOK_RSHIFTEQ: op = sg ? "ashr" : "lshr"; break;
+                    default: op = "add"; break;
                 }
                 EMITI("%%t%d = %s %s %s, %s", ct, op, llty, lval, rval);
                 rval = tmp_name(cg, ct);
                 rhs_kind = OWNERSHIP_BORROWED;
+            } else {
+                if (n->assign.lhs->kind == ND_IDENT) {
+                    SymEntry *e = sym_lookup(cg, n->assign.lhs->ident.name);
+                    if (!e) {
+                        lc_error(n->line, 0, "undefined variable '%s'",
+                                 n->assign.lhs->ident.name);
+                        return rval;
+                    }
+                    store_ptr = e->llvm_name;
+
+                    OwnershipKind prev_kind = e->ownership_kind;
+                    if (type_needs_auto_free(e->type) && !e->is_global && !e->is_param &&
+                        prev_kind == OWNERSHIP_OWNED) {
+                        int old_t = new_tmp(cg);
+                        EMITI("%%t%d = load ptr, ptr %s", old_t, e->llvm_name);
+                        EMITI("call void @free(ptr %%t%d)", old_t);
+                    }
+                } else {
+                    store_ptr = emit_lvalue_ptr(cg, n->assign.lhs);
+                }
             }
+
+            if (!store_ptr || strcmp(store_ptr, "0") == 0) {
+                owned_tmp_consume(cg, rval_raw);
+                owned_tmp_consume(cg, rval);
+                return rval;
+            }
+
+            EMITI("store %s %s, ptr %s", llty, rval, store_ptr);
 
             if (n->assign.lhs->kind == ND_IDENT) {
                 SymEntry *e = sym_lookup(cg, n->assign.lhs->ident.name);
                 if (!e) {
-                    lc_error(n->line, 0, "undefined variable '%s'",
-                             n->assign.lhs->ident.name);
+                    owned_tmp_consume(cg, rval_raw);
+                    owned_tmp_consume(cg, rval);
                     return rval;
                 }
-
-                OwnershipKind prev_kind = e->ownership_kind;
-                if (type_needs_auto_free(e->type) && !e->is_global && !e->is_param &&
-                    prev_kind == OWNERSHIP_OWNED) {
-                    int old_t = new_tmp(cg);
-                    EMITI("%%t%d = load ptr, ptr %s", old_t, e->llvm_name);
-                    EMITI("call void @free(ptr %%t%d)", old_t);
-                }
-
-                EMITI("store %s %s, ptr %s", llty, rval, e->llvm_name);
-
                 if (move_from_ident) {
-                    if (rhs_ident->type && type_needs_auto_free(rhs_ident->type)) {
+                    if (rhs_ident && rhs_ident->type && type_needs_auto_free(rhs_ident->type)) {
                         EMITI("store %s %s, ptr %s", type_to_llvm(rhs_ident->type),
                               zero_init(rhs_ident->type), rhs_ident->llvm_name);
                     }
-                    rhs_ident->ownership_kind = OWNERSHIP_BORROWED;
-                    rhs_ident->owns_value = false;
+                    if (rhs_ident) {
+                        rhs_ident->ownership_kind = OWNERSHIP_BORROWED;
+                        rhs_ident->owns_value = false;
+                    }
                     e->ownership_kind = OWNERSHIP_OWNED;
                     e->owns_value = true;
                     owned_tmp_consume(cg, rval_raw);
@@ -7826,58 +8211,8 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                     e->ownership_kind = OWNERSHIP_UNKNOWN;
                 else
                     e->ownership_kind = OWNERSHIP_BORROWED;
-
-                owned_tmp_consume(cg, rval_raw);
-                owned_tmp_consume(cg, rval);
-            } else if (n->assign.lhs->kind == ND_INDEX) {
-                const char *arr = gen_expr(cg, n->assign.lhs->idx.array);
-                const char *idx = gen_expr(cg, n->assign.lhs->idx.index);
-                Type *arr_ty = n->assign.lhs->idx.array->ty;
-                if (!arr_ty || arr_ty->kind != TY_ARRAY) {
-                    lc_error(n->line, 0, "array indexing requires an array");
-                    return rval;
-                }
-                const char *pt = emit_array_index_ptr(cg, n->assign.lhs, arr, idx);
-                const char *ety2 = type_to_llvm(arr_ty->array.elem
-                                                ? arr_ty->array.elem
-                                                : make_type(a, TY_I64));
-                EMITI("store %s %s, ptr %s", ety2, rval, pt);
-            } else if (n->assign.lhs->kind == ND_FIELD) {
-                ASTNode *obj_node = n->assign.lhs->field.object;
-                const char *fname2 = n->assign.lhs->field.field;
-                Type *obj_ty = obj_node->ty;
-                if (!obj_ty || obj_ty->kind != TY_STRUCT) {
-                    return rval;
-                }
-                ASTNode *sd = find_struct(cg, obj_ty->named.name);
-                if (!sd) {
-                    return rval;
-                }
-                int fidx = -1;
-                for (int i = 0; i < sd->strct.field_count; i++)
-                    if (strcmp(sd->strct.field_names[i], fname2) == 0) {
-                        fidx = i;
-                        break;
-                    }
-                if (fidx < 0) {
-                    return rval;
-                }
-                SymEntry *oe = obj_node->kind == ND_IDENT
-                                   ? sym_lookup(cg, obj_node->ident.name)
-                                   : NULL;
-                if (!oe) {
-                    return rval;
-                }
-                const char *sllty = type_to_llvm(obj_ty);
-                int fp2 = new_tmp(cg);
-                EMITI(
-                    "%%t%d = getelementptr inbounds %s, ptr %s, i32 0, i32 %d",
-                    fp2, sllty, oe->llvm_name, fidx);
-                EMITI("store %s %s, ptr %%t%d", llty, rval, fp2);
-            } else {
-                const char *ptr = gen_expr(cg, n->assign.lhs);
-                EMITI("store %s %s, ptr %s", llty, rval, ptr);
             }
+
             owned_tmp_consume(cg, rval_raw);
             owned_tmp_consume(cg, rval);
             return rval;
