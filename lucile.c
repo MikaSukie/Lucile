@@ -821,6 +821,15 @@ static void dump_escaped_str(FILE *out, const char *s) {
     fputc('"', out);
 }
 
+static void dump_names(FILE *out, const char **items, int count) {
+    fputc('[', out);
+    for (int i = 0; i < count; i++) {
+        if (i) fputs(", ", out);
+        fputs(items[i] ? items[i] : "?", out);
+    }
+    fputc(']', out);
+}
+
 static void dump_ast(ASTNode *n, int depth) {
     if (!n) return;
     dump_indent(depth);
@@ -829,20 +838,29 @@ static void dump_ast(ASTNode *n, int depth) {
     switch (n->kind) {
         case ND_FUNC_DECL:
         case ND_EXTERN_DECL:
-            fprintf(stderr, " name=%s", n->func.name);
+            fprintf(stderr, " name=%s", n->func.name ? n->func.name : "?");
+            fprintf(stderr, " params=%d", n->func.param_count);
+            if (n->func.variadic) fprintf(stderr, " variadic");
+            if (n->func.generic_param)
+                fprintf(stderr, " generic=%s", n->func.generic_param);
+            if (n->func.ret_type) fprintf(stderr, " ret_kind=%d", n->func.ret_type->kind);
             break;
         case ND_STRUCT_DECL:
-            fprintf(stderr, " name=%s", n->strct.name);
+            fprintf(stderr, " name=%s", n->strct.name ? n->strct.name : "?");
             break;
         case ND_ENUM_DECL:
-            fprintf(stderr, " name=%s", n->enm.name);
+            fprintf(stderr, " name=%s", n->enm.name ? n->enm.name : "?");
+            if (n->enm.generic_param_count > 0) {
+                fputs(" generics=", stderr);
+                dump_names(stderr, n->enm.generic_params, n->enm.generic_param_count);
+            }
             break;
         case ND_GLOBAL_VAR:
         case ND_VAR_DECL:
-            fprintf(stderr, " name=%s", n->var.name);
+            fprintf(stderr, " name=%s", n->var.name ? n->var.name : "?");
             break;
         case ND_IDENT:
-            fprintf(stderr, " '%s'", n->ident.name);
+            fprintf(stderr, " '%s'", n->ident.name ? n->ident.name : "?");
             break;
         case ND_INT_LIT:
             fprintf(stderr, " %lld", (long long)n->int_lit.val);
@@ -852,7 +870,7 @@ static void dump_ast(ASTNode *n, int depth) {
             break;
         case ND_STRING_LIT:
             fprintf(stderr, " ");
-            dump_escaped_str(stderr, n->str_lit.val);
+            dump_escaped_str(stderr, n->str_lit.val ? n->str_lit.val : "");
             break;
         case ND_BOOL_LIT:
             fprintf(stderr, " %s", n->bool_lit.val ? "true" : "false");
@@ -862,6 +880,19 @@ static void dump_ast(ASTNode *n, int depth) {
             break;
         case ND_UNARY:
             fprintf(stderr, " op=%s", token_type_name(n->unary.op));
+            break;
+        case ND_CRUMBLE:
+            fprintf(stderr, " targets=");
+            dump_names(stderr, n->crumble.vars, n->crumble.var_count);
+            fprintf(stderr, " r=");
+            if (n->crumble.read_limit < 0) fputs("unlimited", stderr);
+            else fprintf(stderr, "%d", n->crumble.read_limit);
+            fprintf(stderr, " w=");
+            if (n->crumble.write_limit < 0) fputs("unlimited", stderr);
+            else fprintf(stderr, "%d", n->crumble.write_limit);
+            if (n->crumble.is_dropall) fputs(" dropall", stderr);
+            if (n->crumble.is_readonly) fputs(" readonly", stderr);
+            if (n->crumble.is_writeonly) fputs(" writeonly", stderr);
             break;
         default:
             break;
@@ -950,7 +981,6 @@ static void dump_ast(ASTNode *n, int depth) {
             break;
     }
 }
-
 /* ================================================================
    MAIN
    ================================================================ */
@@ -3790,6 +3820,13 @@ static void crumb_pop(CC *cc) {
                 }
             }
 
+            if (e->suppress_scope_warn) {
+                e->reads_left = 0;
+                e->writes_left = 0;
+                e->alive = false;
+                continue;
+            }
+
             if (crumb_needs_ownership_tracking(e->type) &&
                 (!e->explicit_drop || e->reads_left != 0 ||
                  e->writes_left != 0) &&
@@ -3869,6 +3906,14 @@ static void crumb_apply(CC *cc, ASTNode *crumble_node) {
             cc->had_error = true;
             continue;
         }
+
+        bool missing_r = (crumble_node->crumble.read_limit < 0) &&
+                         !crumble_node->crumble.is_dropall &&
+                         !crumble_node->crumble.is_writeonly;
+        bool missing_w = (crumble_node->crumble.write_limit < 0) &&
+                         !crumble_node->crumble.is_dropall &&
+                         !crumble_node->crumble.is_readonly;
+
         if (crumble_node->crumble.read_limit >= 0) {
             e->reads_left = crumble_node->crumble.read_limit;
             e->warn_unlimited = false;
@@ -3890,6 +3935,24 @@ static void crumb_apply(CC *cc, ASTNode *crumble_node) {
         if (crumble_node->crumble.is_writeonly) {
             e->reads_left = 0;
             e->warn_unlimited = false;
+        }
+
+        if (crumble_node->crumble.is_dropall ||
+            crumble_node->crumble.is_readonly ||
+            crumble_node->crumble.is_writeonly) {
+            continue;
+        }
+
+        if (missing_r || missing_w) {
+            char missing[64];
+            missing[0] = '\0';
+            if (missing_r) strcat(missing, "!r");
+            if (missing_r && missing_w) strcat(missing, " and ");
+            if (missing_w) strcat(missing, "!w");
+            lc_warn(crumble_node->line,
+                    "[CrumbChecker] crumble(%s) omits %s; missing limits are "
+                    "treated as unlimited",
+                    name, missing);
         }
     }
 }
