@@ -35,7 +35,6 @@ Built-in types:
 - `u8`, `u16`, `u32`, `u64`
 - `f32`, `f64`
 - `str`
-- `string`
 - `char`
 - `int`
 - `float`
