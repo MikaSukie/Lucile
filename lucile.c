@@ -3853,7 +3853,7 @@ static void crumb_pop(CC *cc) {
                 e->reads_used + e->writes_used == 0) {
                 lc_warn(e->decl_line,
                         "[CrumbChecker] '%s' was declared but never accessed; "
-                        "possible resource leak",
+                        "scope cleanup will still drop it",
                         e->name);
             }
 
