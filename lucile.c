@@ -516,11 +516,20 @@ void semantic_check(ASTNode *program);
    CODE GENERATOR  (emits LLVM IR text)
    ================================================================ */
 
+typedef enum {
+    OWNERSHIP_BORROWED = 0,
+    OWNERSHIP_OWNED = 1,
+    OWNERSHIP_UNKNOWN = 2
+} OwnershipKind;
+
 typedef struct SymEntry {
     const char *name;
     Type *type;
     const char *llvm_name;
     bool is_global;
+    bool is_param;
+    bool owns_value;
+    OwnershipKind ownership_kind;
     bool is_enum_tag;
     int enum_index;
     struct SymEntry *next;
@@ -554,6 +563,11 @@ typedef struct {
     bool *str_inline;
     int str_count, str_cap;
 
+    const char **owned_tmps;
+    Type **owned_tmp_types;
+    bool *owned_tmp_is_addr;
+    int owned_tmp_count, owned_tmp_cap;
+
     const char *cur_func;
     Type *cur_ret;
     bool ret_emitted;
@@ -578,6 +592,8 @@ typedef struct {
 
     int cur_loop_header;
     int cur_loop_exit;
+    SymScope *func_scope;
+    SymScope *loop_scope;
     bool block_terminated;
     int cur_lbl;
     const char *cur_base_func;
@@ -5092,6 +5108,19 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
                 ty = NULL;
                 break;
             }
+
+            if (strcmp(n->call.callee->ident.name, "free") == 0) {
+                if (n->call.arg_count != 1) {
+                    lc_error_at(sc->source_path, n->line, 0,
+                                "free expects exactly one argument");
+                    sc->had_error = true;
+                } else {
+                    (void)sem_infer_expr(sc, n->call.args[0]);
+                }
+                ty = make_type(sc->arena, TY_VOID);
+                break;
+            }
+
             ASTNode *fd =
                 sem_find_func(sc->program, n->call.callee->ident.name);
             if (!fd) {
@@ -5452,17 +5481,99 @@ static SymScope *scope_push(Codegen *cg) {
     return s;
 }
 
-static void scope_pop(Codegen *cg) { cg->scope = cg->scope->parent; }
+static bool type_needs_auto_free(Type *ty) {
+    return ty && (ty->kind == TY_PTR || ty->kind == TY_STRING);
+}
 
-static void sym_define(Codegen *cg, const char *name, Type *ty,
-                       const char *llvm_name, bool global) {
+static void emit_free_entry(Codegen *cg, SymEntry *e) {
+    if (!e || e->is_global || e->is_param ||
+        e->ownership_kind != OWNERSHIP_OWNED || !type_needs_auto_free(e->type))
+        return;
+    int t = ++cg->tmp;
+    fprintf(cg->out, "  %%t%d = load ptr, ptr %s\n", t, e->llvm_name);
+    fprintf(cg->out, "  call void @free(ptr %%t%d)\n", t);
+}
+
+static void emit_scope_cleanup(Codegen *cg, SymScope *from, SymScope *stop) {
+    if (!cg || cg->block_terminated) return;
+    for (SymScope *s = from; s && s != stop; s = s->parent) {
+        for (SymEntry *e = s->entries; e; e = e->next)
+            emit_free_entry(cg, e);
+    }
+    if (stop) {
+        for (SymEntry *e = stop->entries; e; e = e->next)
+            emit_free_entry(cg, e);
+    }
+}
+
+static void owned_tmp_track(Codegen *cg, const char *name, Type *ty,
+                            bool is_addr) {
+    if (!cg || !name || !type_needs_auto_free(ty)) return;
+    if (cg->owned_tmp_count >= cg->owned_tmp_cap) {
+        int nc = cg->owned_tmp_cap ? cg->owned_tmp_cap * 2 : 8;
+        const char **nn = arena_alloc(cg->arena, sizeof(void *) * (size_t)nc);
+        Type **nt = arena_alloc(cg->arena, sizeof(void *) * (size_t)nc);
+        bool *na = arena_alloc(cg->arena, sizeof(bool) * (size_t)nc);
+        for (int i = 0; i < cg->owned_tmp_count; i++) {
+            nn[i] = cg->owned_tmps ? cg->owned_tmps[i] : NULL;
+            nt[i] = cg->owned_tmp_types ? cg->owned_tmp_types[i] : NULL;
+            na[i] = cg->owned_tmp_is_addr ? cg->owned_tmp_is_addr[i] : false;
+        }
+        cg->owned_tmps = nn;
+        cg->owned_tmp_types = nt;
+        cg->owned_tmp_is_addr = na;
+        cg->owned_tmp_cap = nc;
+    }
+    cg->owned_tmps[cg->owned_tmp_count] = name;
+    cg->owned_tmp_types[cg->owned_tmp_count] = ty;
+    cg->owned_tmp_is_addr[cg->owned_tmp_count] = is_addr;
+    cg->owned_tmp_count++;
+}
+
+static void owned_tmp_consume(Codegen *cg, const char *name) {
+    if (!cg || !name || !cg->owned_tmp_count) return;
+    for (int i = 0; i < cg->owned_tmp_count; i++) {
+        if (cg->owned_tmps[i] && strcmp(cg->owned_tmps[i], name) == 0)
+            cg->owned_tmps[i] = NULL;
+    }
+}
+
+static void owned_tmp_flush(Codegen *cg) {
+    if (!cg || cg->block_terminated || !cg->owned_tmp_count) return;
+    for (int i = 0; i < cg->owned_tmp_count; i++) {
+        if (!cg->owned_tmps[i]) continue;
+        Type *ty = cg->owned_tmp_types ? cg->owned_tmp_types[i] : NULL;
+        if (!type_needs_auto_free(ty)) continue;
+        if (cg->owned_tmp_is_addr && cg->owned_tmp_is_addr[i]) {
+            int t = ++cg->tmp;
+            fprintf(cg->out, "  %%t%d = load ptr, ptr %s\n", t, cg->owned_tmps[i]);
+            fprintf(cg->out, "  call void @free(ptr %%t%d)\n", t);
+        } else {
+            fprintf(cg->out, "  call void @free(ptr %s)\n", cg->owned_tmps[i]);
+        }
+    }
+    cg->owned_tmp_count = 0;
+}
+
+static void scope_pop(Codegen *cg) {
+    if (!cg || !cg->scope) return;
+    emit_scope_cleanup(cg, cg->scope, NULL);
+    cg->scope = cg->scope->parent;
+}
+
+static SymEntry *sym_define(Codegen *cg, const char *name, Type *ty,
+                            const char *llvm_name, bool global) {
     SymEntry *e = arena_alloc(cg->arena, sizeof(SymEntry));
     e->name = name;
     e->type = ty;
     e->llvm_name = llvm_name;
     e->is_global = global;
+    e->is_param = false;
+    e->owns_value = false;
+    e->ownership_kind = OWNERSHIP_BORROWED;
     e->next = cg->scope->entries;
     cg->scope->entries = e;
+    return e;
 }
 
 static SymEntry *sym_lookup(Codegen *cg, const char *name) {
@@ -5472,9 +5583,82 @@ static SymEntry *sym_lookup(Codegen *cg, const char *name) {
     return NULL;
 }
 
+static bool type_needs_auto_free(Type *ty);
+static ASTNode *find_func(Codegen *cg, const char *name);
+
+static bool func_name_implies_owned(const char *name) {
+    if (!name) return false;
+    return strstr(name, "input") != NULL || strstr(name, "tostr") != NULL;
+}
+
+static OwnershipKind expr_ownership_kind(Codegen *cg, ASTNode *n) {
+    if (!cg || !n) return OWNERSHIP_BORROWED;
+
+    switch (n->kind) {
+        case ND_STRING_LIT:
+        case ND_FORMAT_STR:
+            return OWNERSHIP_BORROWED;
+
+        case ND_IDENT:
+            return OWNERSHIP_BORROWED;
+
+        case ND_CALL: {
+            if (n->call.callee && n->call.callee->kind == ND_IDENT) {
+                const char *fname = n->call.callee->ident.name;
+                if (!fname) return OWNERSHIP_BORROWED;
+                if (strcmp(fname, "free") == 0) return OWNERSHIP_BORROWED;
+
+                ASTNode *fd = find_func(cg, fname);
+                if (fd && fd->kind == ND_EXTERN_DECL) {
+                    if (fd->func.is_unsafe) return OWNERSHIP_UNKNOWN;
+                    if (fd->func.ret_type && type_needs_auto_free(fd->func.ret_type))
+                        return OWNERSHIP_OWNED;
+                    return OWNERSHIP_BORROWED;
+                }
+
+                if (func_name_implies_owned(fname))
+                    return OWNERSHIP_OWNED;
+            }
+            return OWNERSHIP_BORROWED;
+        }
+
+        case ND_TERNARY: {
+            OwnershipKind a = expr_ownership_kind(cg, n->ternary.then_val);
+            OwnershipKind b = expr_ownership_kind(cg, n->ternary.else_val);
+            if (a == OWNERSHIP_OWNED && b == OWNERSHIP_OWNED)
+                return OWNERSHIP_OWNED;
+            if (a == OWNERSHIP_UNKNOWN || b == OWNERSHIP_UNKNOWN)
+                return OWNERSHIP_UNKNOWN;
+            return OWNERSHIP_BORROWED;
+        }
+
+        case ND_UNARY:
+            return expr_ownership_kind(cg, n->unary.operand);
+
+        case ND_CAST:
+            return expr_ownership_kind(cg, n->cast.operand);
+
+        default:
+            return OWNERSHIP_BORROWED;
+    }
+}
+
+static bool expr_is_owned_value(Codegen *cg, ASTNode *n) {
+    return expr_ownership_kind(cg, n) == OWNERSHIP_OWNED;
+}
+
+static bool expr_is_move_source(Codegen *cg, ASTNode *n, Type *ty) {
+    if (!cg || !n || n->kind != ND_IDENT || !type_needs_auto_free(ty))
+        return false;
+    SymEntry *e = sym_lookup(cg, n->ident.name);
+    return e && e->ownership_kind == OWNERSHIP_OWNED;
+}
+
 /* ================================================================
    HELPERS
    ================================================================ */
+
+static int new_tmp(Codegen *cg);
 
 static int new_tmp(Codegen *cg) { return ++cg->tmp; }
 static int new_lbl(Codegen *cg) { return ++cg->lbl; }
@@ -6939,6 +7123,36 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             Type *generic_actual = NULL;
             Type **param_tys = NULL;
 
+            if (n->call.callee->kind == ND_IDENT &&
+                strcmp(n->call.callee->ident.name, "free") == 0) {
+                if (n->call.arg_count != 1) {
+                    lc_error(n->line, 0, "free expects exactly one argument");
+                    return "0";
+                }
+                ASTNode *free_arg_node = n->call.args[0];
+                const char *free_arg_raw = gen_expr(cg, free_arg_node);
+                const char *free_arg = coerce_value(
+                    cg, free_arg_raw,
+                    free_arg_node ? free_arg_node->ty : NULL,
+                    make_type(a, TY_PTR));
+                EMITI("call void @free(ptr %s)", free_arg);
+
+                if (free_arg_node && free_arg_node->kind == ND_IDENT) {
+                    SymEntry *se = sym_lookup(cg, free_arg_node->ident.name);
+                    if (se && se->type && type_needs_auto_free(se->type)) {
+                        EMITI("store %s %s, ptr %s",
+                              type_to_llvm(se->type), zero_init(se->type),
+                              se->llvm_name);
+                        se->ownership_kind = OWNERSHIP_BORROWED;
+                        se->owns_value = false;
+                    }
+                }
+
+                owned_tmp_consume(cg, free_arg_raw);
+                owned_tmp_consume(cg, free_arg);
+                return NULL;
+            }
+
             if (n->call.callee->kind == ND_IDENT)
                 fd_for_call = find_func(cg, n->call.callee->ident.name);
 
@@ -7059,7 +7273,12 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             cg->generic_name = save_gname;
             cg->generic_actual = save_gactual;
 
-            if (has_ret) return tmp_name(cg, rt);
+            if (has_ret) {
+                const char *ret_name = tmp_name(cg, rt);
+                if (expr_is_owned_value(cg, n))
+                    owned_tmp_track(cg, ret_name, ret_ty, false);
+                return ret_name;
+            }
             return NULL;
         }
 
@@ -7071,8 +7290,19 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             if (n->assign.rhs && n->assign.rhs->kind == ND_CALL && lhs_ty &&
                 (!n->assign.rhs->ty || n->assign.rhs->ty->kind == TY_CONTEXT))
                 n->assign.rhs->ty = lhs_ty;
-            const char *rval = gen_expr(cg, n->assign.rhs);
-            rval = coerce_value(cg, rval, rhs_ty, lhs_ty);
+
+            OwnershipKind rhs_kind = expr_ownership_kind(cg, n->assign.rhs);
+            bool rhs_is_ident = n->assign.rhs && n->assign.rhs->kind == ND_IDENT;
+            SymEntry *rhs_ident = rhs_is_ident
+                                      ? sym_lookup(cg, n->assign.rhs->ident.name)
+                                      : NULL;
+            bool move_from_ident = expr_is_move_source(cg, n->assign.rhs, rhs_ty) &&
+                                   n->assign.lhs &&
+                                   n->assign.lhs->kind == ND_IDENT &&
+                                   strcmp(n->assign.lhs->ident.name, n->assign.rhs->ident.name) != 0;
+
+            const char *rval_raw = gen_expr(cg, n->assign.rhs);
+            const char *rval = coerce_value(cg, rval_raw, rhs_ty, lhs_ty);
             const char *llty = type_to_llvm(lhs_ty);
 
             if (n->assign.op != TOK_EQ) {
@@ -7119,6 +7349,7 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                 }
                 EMITI("%%t%d = %s %s %s, %s", ct, op, llty, lval, rval);
                 rval = tmp_name(cg, ct);
+                rhs_kind = OWNERSHIP_BORROWED;
             }
 
             if (n->assign.lhs->kind == ND_IDENT) {
@@ -7128,7 +7359,40 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                              n->assign.lhs->ident.name);
                     return rval;
                 }
+
+                OwnershipKind prev_kind = e->ownership_kind;
+                if (type_needs_auto_free(e->type) && !e->is_global && !e->is_param &&
+                    prev_kind == OWNERSHIP_OWNED) {
+                    int old_t = new_tmp(cg);
+                    EMITI("%%t%d = load ptr, ptr %s", old_t, e->llvm_name);
+                    EMITI("call void @free(ptr %%t%d)", old_t);
+                }
+
                 EMITI("store %s %s, ptr %s", llty, rval, e->llvm_name);
+
+                if (move_from_ident) {
+                    if (rhs_ident->type && type_needs_auto_free(rhs_ident->type)) {
+                        EMITI("store %s %s, ptr %s", type_to_llvm(rhs_ident->type),
+                              zero_init(rhs_ident->type), rhs_ident->llvm_name);
+                    }
+                    rhs_ident->ownership_kind = OWNERSHIP_BORROWED;
+                    rhs_ident->owns_value = false;
+                    e->ownership_kind = OWNERSHIP_OWNED;
+                    e->owns_value = true;
+                    owned_tmp_consume(cg, rval_raw);
+                    owned_tmp_consume(cg, rval);
+                    return rval;
+                }
+
+                if (rhs_kind == OWNERSHIP_OWNED)
+                    e->ownership_kind = OWNERSHIP_OWNED;
+                else if (rhs_kind == OWNERSHIP_UNKNOWN)
+                    e->ownership_kind = OWNERSHIP_UNKNOWN;
+                else
+                    e->ownership_kind = OWNERSHIP_BORROWED;
+
+                owned_tmp_consume(cg, rval_raw);
+                owned_tmp_consume(cg, rval);
             } else if (n->assign.lhs->kind == ND_INDEX) {
                 const char *arr = gen_expr(cg, n->assign.lhs->idx.array);
                 const char *idx = gen_expr(cg, n->assign.lhs->idx.index);
@@ -7178,6 +7442,8 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                 const char *ptr = gen_expr(cg, n->assign.lhs);
                 EMITI("store %s %s, ptr %s", llty, rval, ptr);
             }
+            owned_tmp_consume(cg, rval_raw);
+            owned_tmp_consume(cg, rval);
             return rval;
         }
 
@@ -7202,6 +7468,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             for (int i = 0; i < n->block.count; i++)
                 gen_stmt(cg, n->block.stmts[i]);
             scope_pop(cg);
+            owned_tmp_flush(cg);
             break;
 
         case ND_VAR_DECL: {
@@ -7216,17 +7483,42 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             const char *alloca_name = tmp_name(cg, t);
             EMITI("%s = alloca %s", alloca_name, llty);
             EMITI("store %s %s, ptr %s", llty, zero_init(ty), alloca_name);
-            sym_define(cg, n->var.name, ty, alloca_name, false);
+            SymEntry *e = sym_define(cg, n->var.name, ty, alloca_name, false);
 
             if (n->var.init) {
                 if (n->var.init->kind == ND_CALL && ty &&
                     (!n->var.init->ty || n->var.init->ty->kind == TY_CONTEXT))
                     n->var.init->ty = ty;
-                const char *ival = gen_expr(cg, n->var.init);
-                ival = coerce_value(cg, ival,
-                                    n->var.init ? n->var.init->ty : NULL, ty);
+                OwnershipKind init_kind = expr_ownership_kind(cg, n->var.init);
+                bool init_is_ident = n->var.init->kind == ND_IDENT;
+                SymEntry *src = init_is_ident ? sym_lookup(cg, n->var.init->ident.name) : NULL;
+                bool move_from_ident = init_is_ident && src &&
+                                       src->ownership_kind == OWNERSHIP_OWNED &&
+                                       type_needs_auto_free(src->type);
+                const char *ival_raw = gen_expr(cg, n->var.init);
+                const char *ival = coerce_value(cg, ival_raw,
+                                                n->var.init ? n->var.init->ty : NULL,
+                                                ty);
                 EMITI("store %s %s, ptr %s", llty, ival, alloca_name);
+                owned_tmp_consume(cg, ival_raw);
+                owned_tmp_consume(cg, ival);
+
+                if (move_from_ident) {
+                    EMITI("store %s %s, ptr %s", type_to_llvm(src->type),
+                          zero_init(src->type), src->llvm_name);
+                    src->ownership_kind = OWNERSHIP_BORROWED;
+                    src->owns_value = false;
+                    e->ownership_kind = OWNERSHIP_OWNED;
+                    e->owns_value = true;
+                } else {
+                    e->ownership_kind = init_kind;
+                    e->owns_value = (e->ownership_kind == OWNERSHIP_OWNED);
+                }
+            } else {
+                e->ownership_kind = OWNERSHIP_BORROWED;
+                e->owns_value = false;
             }
+            owned_tmp_flush(cg);
             break;
         }
 
@@ -7236,20 +7528,41 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 gen_expr(cg, n);
             else
                 gen_expr(cg, n->expr_stmt.expr);
+            owned_tmp_flush(cg);
             break;
 
         case ND_RETURN: {
             Type *ret_ty = cg->cur_ret;
             if (!ret_ty || ret_ty->kind == TY_VOID) {
+                if (cg->func_scope)
+                    emit_scope_cleanup(cg, cg->scope, cg->func_scope->parent);
+                owned_tmp_flush(cg);
                 EMIT_TERM("ret void");
             } else if (n->ret.val) {
-                const char *val = gen_expr(cg, n->ret.val);
-                val = coerce_value(cg, val, n->ret.val ? n->ret.val->ty : NULL,
-                                   ret_ty);
+                if (n->ret.val->kind == ND_IDENT) {
+                    SymEntry *re = sym_lookup(cg, n->ret.val->ident.name);
+                    if (re && re->type && type_needs_auto_free(re->type) &&
+                        re->ownership_kind == OWNERSHIP_OWNED) {
+                        re->ownership_kind = OWNERSHIP_BORROWED;
+                        re->owns_value = false;
+                    }
+                }
+                if (cg->func_scope)
+                    emit_scope_cleanup(cg, cg->scope, cg->func_scope->parent);
+                const char *val_raw = gen_expr(cg, n->ret.val);
+                const char *val = coerce_value(cg, val_raw,
+                                               n->ret.val ? n->ret.val->ty : NULL,
+                                               ret_ty);
                 const char *llty = cg_type_to_llvm(cg, ret_ty);
+                owned_tmp_consume(cg, val_raw);
+                owned_tmp_consume(cg, val);
+                owned_tmp_flush(cg);
                 EMIT_TERM("ret %s %s", llty, val);
             } else {
+                if (cg->func_scope)
+                    emit_scope_cleanup(cg, cg->scope, cg->func_scope->parent);
                 const char *llty = cg_type_to_llvm(cg, ret_ty);
+                owned_tmp_flush(cg);
                 EMIT_TERM("ret %s %s", llty, zero_init(ret_ty));
             }
             cg->ret_emitted = true;
@@ -7262,6 +7575,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             int else_lbl = new_lbl(cg);
             int merge_lbl = new_lbl(cg);
 
+            owned_tmp_flush(cg);
             EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
                   lbl_name(cg, then_lbl), lbl_name(cg, else_lbl));
 
@@ -7286,10 +7600,12 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
             int save_header = cg->cur_loop_header;
             int save_exit   = cg->cur_loop_exit;
+            SymScope *save_loop_scope = cg->loop_scope;
             cg->cur_loop_header = header_lbl;
             cg->cur_loop_exit   = exit_lbl;
 
             scope_push(cg);
+            cg->loop_scope = cg->scope;
 
             if (n->loop.counter) gen_stmt(cg, n->loop.counter);
 
@@ -7298,6 +7614,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
             if (n->loop.cond) {
                 const char *cond = gen_expr(cg, n->loop.cond);
+                owned_tmp_flush(cg);
                 EMIT_TERM("br i1 %s, label %%%s, label %%%s", cond,
                       lbl_name(cg, body_lbl), lbl_name(cg, exit_lbl));
             } else {
@@ -7307,7 +7624,10 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             EMIT_LABEL(body_lbl);
             gen_stmt(cg, n->loop.body);
 
-            if (n->loop.step) gen_expr(cg, n->loop.step);
+            if (n->loop.step) {
+                gen_expr(cg, n->loop.step);
+                owned_tmp_flush(cg);
+            }
 
             if (!cg->block_terminated)
                 EMIT_TERM("br label %%%s", lbl_name(cg, header_lbl));
@@ -7316,20 +7636,27 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
 
             cg->cur_loop_header = save_header;
             cg->cur_loop_exit   = save_exit;
+            cg->loop_scope = save_loop_scope;
             break;
         }
 
         case ND_BREAK:
-            if (cg->cur_loop_exit)
+            if (cg->cur_loop_exit) {
+                if (cg->loop_scope)
+                    emit_scope_cleanup(cg, cg->scope, cg->loop_scope->parent);
+                owned_tmp_flush(cg);
                 EMIT_TERM("br label %%%s", lbl_name(cg, cg->cur_loop_exit));
-            else
+            } else
                 lc_error(n->line, 0, "'br' used outside of a loop");
             break;
 
         case ND_CONTINUE:
-            if (cg->cur_loop_header)
+            if (cg->cur_loop_header) {
+                if (cg->loop_scope)
+                    emit_scope_cleanup(cg, cg->scope, cg->loop_scope);
+                owned_tmp_flush(cg);
                 EMIT_TERM("br label %%%s", lbl_name(cg, cg->cur_loop_header));
-            else
+            } else
                 lc_error(n->line, 0, "'cont' used outside of a loop");
             break;
 
@@ -7363,6 +7690,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 const char *subj = gen_expr(cg, n->match.subject);
                 EMITI("%%t%d = extractvalue %s %s, 0", tag_t, ety, subj);
             }
+            owned_tmp_flush(cg);
 
             int default_lbl = new_lbl(cg);
             int merge_lbl = new_lbl(cg);
@@ -7564,7 +7892,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
         }
 
         case ND_CRUMBLE:
-
+            owned_tmp_flush(cg);
             break;
 
         default:
@@ -7762,12 +8090,15 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
     Type *save_generic_actual = cg->generic_actual;
     Type *save_context_actual = cg->context_actual;
     const char *save_base_func = cg->cur_base_func;
+    SymScope *save_func_scope = cg->func_scope;
+    SymScope *save_loop_scope = cg->loop_scope;
     cg->cur_func = fname;
     if (!cg->cur_base_func) cg->cur_base_func = fname;
     cg->cur_ret = ret_ty;
     cg->ret_emitted = false;
 
     scope_push(cg);
+    cg->func_scope = cg->scope;
 
     for (int i = 0; i < fn->func.param_count; i++) {
         Type *pty = fn->func.param_types[i];
@@ -7775,7 +8106,8 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
         int t = new_tmp(cg);
         EMITI("%%t%d = alloca %s", t, llty);
         EMITI("store %s %%%s.arg, ptr %%t%d", llty, fn->func.param_names[i], t);
-        sym_define(cg, fn->func.param_names[i], pty, tmp_name(cg, t), false);
+        SymEntry *pe = sym_define(cg, fn->func.param_names[i], pty, tmp_name(cg, t), false);
+        if (pe) pe->is_param = true;
     }
 
     if (fn->func.body) {
@@ -7791,6 +8123,8 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
     }
 
     scope_pop(cg);
+    cg->func_scope = save_func_scope;
+    cg->loop_scope = save_loop_scope;
     cg->generic_name = save_generic_name;
     cg->generic_actual = save_generic_actual;
     cg->context_actual = save_context_actual;
@@ -7910,6 +8244,7 @@ void codegen_run(FILE *out, ASTNode *program, Arena *a) {
 
     EMIT("declare i32 @sprintf(ptr, ptr, ...)");
     EMIT("declare void @llvm.trap()");
+    EMIT("declare void @free(ptr)");
     for (int i = 0; i < cg->program->program.count; i++) {
         ASTNode *item = cg->program->program.items[i];
         if (item->kind == ND_EXTERN_DECL) emit_extern(cg, item);
