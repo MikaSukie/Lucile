@@ -5058,7 +5058,7 @@ const char * specialize_generic_func(Codegen * cg, ASTNode * fn, Type * actual) 
     sp -> generic_name = fn -> func.generic_param;
     sp -> actual = actual;
     sp -> fn = fn;
-    sp -> name = arena_sprintf(cg -> arena, "__BHUMI__%s_%s", fn -> func.name, key + strlen(fn -> func.name) + 2);
+    sp -> name = arena_sprintf(cg -> arena, "__Lucile__%s_%s", fn -> func.name, key + strlen(fn -> func.name) + 2);
     sp -> emitted = false;
     sp -> spec = arena_alloc(cg -> arena, sizeof(ASTNode));
     * sp -> spec = * fn;
@@ -5089,7 +5089,7 @@ const char * specialize_context_func(Codegen * cg, ASTNode * fn, Type * actual) 
     sp -> generic_name = "#";
     sp -> actual = actual;
     sp -> fn = fn;
-    sp -> name = arena_sprintf(cg -> arena, "__BHUMI__%s_ctx_%s", fn -> func.name, mbuf);
+    sp -> name = arena_sprintf(cg -> arena, "__Lucile__%s_ctx_%s", fn -> func.name, mbuf);
     sp -> emitted = false;
     sp -> spec = arena_alloc(cg -> arena, sizeof(ASTNode));
     * sp -> spec = * fn;
