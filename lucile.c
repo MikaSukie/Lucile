@@ -801,6 +801,25 @@ static void dump_indent(int d) {
     for (int i = 0; i < d; i++) fputs("  ", stderr);
 }
 
+static void dump_escaped_str(FILE *out, const char *s) {
+    fputc('"', out);
+    for (; *s; s++) {
+        switch (*s) {
+            case '\n': fputs("\\n", out); break;
+            case '\t': fputs("\\t", out); break;
+            case '\r': fputs("\\r", out); break;
+            case '\"': fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            default:
+                if ((unsigned char)*s < 32 || (unsigned char)*s > 126)
+                    fprintf(out, "\\x%02X", (unsigned char)*s);
+                else
+                    fputc(*s, out);
+        }
+    }
+    fputc('"', out);
+}
+
 static void dump_ast(ASTNode *n, int depth) {
     if (!n) return;
     dump_indent(depth);
@@ -831,7 +850,8 @@ static void dump_ast(ASTNode *n, int depth) {
             fprintf(stderr, " %g", n->float_lit.val);
             break;
         case ND_STRING_LIT:
-            fprintf(stderr, " \"%s\"", n->str_lit.val);
+            fprintf(stderr, " ");
+            dump_escaped_str(stderr, n->str_lit.val);
             break;
         case ND_BOOL_LIT:
             fprintf(stderr, " %s", n->bool_lit.val ? "true" : "false");
