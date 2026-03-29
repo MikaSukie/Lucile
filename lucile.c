@@ -580,6 +580,7 @@ typedef struct {
     int cur_loop_exit;
     bool block_terminated;
     int cur_lbl;
+    const char *cur_base_func;
 } Codegen;
 
 void codegen_run(FILE *out, ASTNode *program, Arena *a);
@@ -2198,8 +2199,8 @@ static ASTNode *parse_expr(Parser *p) { return parse_binary(p, PREC_NONE); }
 static ASTNode *parse_stmt(Parser *p);
 static bool stmt_terminator(Parser *p) {
     if (match_tok(p, TOK_SEMICOLON)) return true;
-    if (check(p, TOK_RBRACE) || check(p, TOK_EOF)) return true;
-    lc_error(p->cur.line, p->cur.col, "expected ';' or end of block");
+    lc_error(p->cur.line, p->cur.col, "expected ';'");
+    p->had_error = true;
     return false;
 }
 
@@ -3777,13 +3778,13 @@ static void crumb_pop(CC *cc) {
             if (e->warn_unlimited) {
                 if (e->reads_left == -1 && e->reads_used > 0) {
                     lc_warn(e->decl_line,
-                            "crumb: '%s' had unlimited reads (%d detected); "
+                            "[CrumbChecker] '%s' had unlimited reads (%d detected); "
                             "consider crumble(%s)!r=%d",
                             e->name, e->reads_used, e->name, e->reads_used);
                 }
                 if (e->writes_left == -1 && e->writes_used > 0) {
                     lc_warn(e->decl_line,
-                            "crumb: '%s' had unlimited writes (%d detected); "
+                            "[CrumbChecker] '%s' had unlimited writes (%d detected); "
                             "consider crumble(%s)!w=%d",
                             e->name, e->writes_used, e->name, e->writes_used);
                 }
@@ -3794,7 +3795,7 @@ static void crumb_pop(CC *cc) {
                  e->writes_left != 0) &&
                 e->reads_used + e->writes_used > 0) {
                 lc_warn(e->decl_line,
-                        "crumb: auto-dropping '%s' at scope end; use dropall(%s)"
+                        "[CrumbChecker] auto-dropping '%s' at scope end; use dropall(%s)"
                         " to make the cleanup explicit",
                         e->name, e->name);
             }
@@ -3805,7 +3806,7 @@ static void crumb_pop(CC *cc) {
                 e->reads_used + e->writes_used > 0 &&
                 !e->explicit_drop) {
                 lc_warn(e->decl_line,
-                        "crumb: '%s' is a compound type dropped at scope end; "
+                        "[CrumbChecker] '%s' is a compound type dropped at scope end; "
                         "if it owns heap resources, call dropall(%s) and free "
                         "fields manually to avoid leaks",
                         e->name, e->name);
@@ -3814,7 +3815,7 @@ static void crumb_pop(CC *cc) {
             if (crumb_needs_ownership_tracking(e->type) &&
                 e->reads_used + e->writes_used == 0) {
                 lc_warn(e->decl_line,
-                        "crumb: '%s' was declared but never accessed; "
+                        "[CrumbChecker] '%s' was declared but never accessed; "
                         "possible resource leak",
                         e->name);
             }
@@ -3864,7 +3865,7 @@ static void crumb_apply(CC *cc, ASTNode *crumble_node) {
         CrumbInfo *e = crumb_find(cc, name);
         if (!e) {
             lc_error(crumble_node->line, 0,
-                     "crumb: variable '%s' not found in scope", name);
+                     "[CrumbChecker] variable '%s' not found in scope", name);
             cc->had_error = true;
             continue;
         }
@@ -3928,14 +3929,14 @@ static void crumb_read(CC *cc, const char *name, int line) {
     if (!e->alive) {
         int col = crumb_ident_col(line, name);
         lc_error_tok(line, col, (int)strlen(name),
-                     "crumb: '%s' is out of scope", name);
+                     "[CrumbChecker] '%s' is out of scope", name);
         cc->had_error = true;
         return;
     }
     if (e->reads_left == 0) {
         int col = crumb_ident_col(line, name);
         lc_error_tok(line, col, (int)strlen(name),
-                     "crumb: '%s' has no reads remaining (exhausted)", name);
+                     "[CrumbChecker] '%s' has no reads remaining (exhausted)", name);
         cc->had_error = true;
         return;
     }
@@ -3943,8 +3944,8 @@ static void crumb_read(CC *cc, const char *name, int line) {
     e->reads_used++;
     if (cc->loop_depth > 0 && e->reads_left >= 0 && !e->loop_warn_emitted) {
         lc_warn(line,
-                "crumb: '%s' has a finite read limit (%d remaining) "
-                "inside a loop — may exhaust before the loop ends",
+                "[CrumbChecker] '%s' has a finite read limit (%d remaining) "
+                "inside a loop, may exhaust before the loop ends",
                 name, e->reads_left);
         e->loop_warn_emitted = true;
     }
@@ -3956,14 +3957,14 @@ static void crumb_write(CC *cc, const char *name, int line) {
     if (!e->alive) {
         int col = crumb_ident_col(line, name);
         lc_error_tok(line, col, (int)strlen(name),
-                     "crumb: '%s' is out of scope", name);
+                     "[CrumbChecker] '%s' is out of scope", name);
         cc->had_error = true;
         return;
     }
     if (e->writes_left == 0) {
         int col = crumb_ident_col(line, name);
         lc_error_tok(line, col, (int)strlen(name),
-                     "crumb: '%s' has no writes remaining (exhausted)", name);
+                     "[CrumbChecker] '%s' has no writes remaining (exhausted)", name);
         cc->had_error = true;
         return;
     }
@@ -3971,8 +3972,8 @@ static void crumb_write(CC *cc, const char *name, int line) {
     e->writes_used++;
     if (cc->loop_depth > 0 && e->writes_left >= 0 && !e->loop_warn_emitted) {
         lc_warn(line,
-                "crumb: '%s' has a finite write limit (%d remaining) "
-                "inside a loop — may exhaust before the loop ends",
+                "[CrumbChecker] '%s' has a finite write limit (%d remaining) "
+                "inside a loop, may exhaust before the loop ends",
                 name, e->writes_left);
         e->loop_warn_emitted = true;
     }
@@ -4152,7 +4153,6 @@ static void check_stmt(CC *cc, ASTNode *n) {
             crumb_pop(cc);
             break;
         case ND_VAR_DECL: {
-            if (n->var.init) check_expr(cc, n->var.init);
             bool need_tracking = crumb_needs_ownership_tracking(n->var.type);
             crumb_declare(cc, n->var.name, n->var.type, n->line,
                           need_tracking && !n->var.nomd);
@@ -4160,6 +4160,7 @@ static void check_stmt(CC *cc, ASTNode *n) {
                 CrumbInfo *e = crumb_find(cc, n->var.name);
                 if (e) e->warn_unlimited = false;
             }
+            if (n->var.init) check_expr(cc, n->var.init);
             break;
         }
         case ND_CRUMBLE:
@@ -4286,8 +4287,7 @@ void crumb_check(ASTNode *program) {
 
 /* ================================================================
    SEMANTIC CHECKER
-   - catches duplicate definitions
-   - checks type compatibility
+   catches duplicate definitions and checks type compatibility
    ================================================================ */
 
 typedef struct SemEntry {
@@ -4502,6 +4502,55 @@ static bool sem_types_compatible(Type *src, Type *dst) {
     return false;
 }
 
+static Type *sem_array_literal_type(SemCtx *sc, ASTNode *n) {
+    if (!n || n->kind != ND_ARRAY_LIT) return make_type(sc->arena, TY_VOID);
+    if (n->array_lit.count <= 0) {
+        lc_error_at(sc->source_path, n->line, 0,
+                    "empty array literal requires an explicit array type");
+        sc->had_error = true;
+        Type *ty = make_type(sc->arena, TY_ARRAY);
+        ty->array.elem = make_type(sc->arena, TY_VOID);
+        ty->array.count = 0;
+        return ty;
+    }
+
+    Type *elem = sem_infer_expr(sc, n->array_lit.elems[0]);
+    if (!elem) elem = make_type(sc->arena, TY_VOID);
+
+    for (int i = 1; i < n->array_lit.count; i++) {
+        Type *et = sem_infer_expr(sc, n->array_lit.elems[i]);
+        if (!sem_types_compatible(et, elem) &&
+            !sem_types_compatible(elem, et)) {
+            lc_error_at(sc->source_path, n->line, 0,
+                        "array literal elements must have compatible types");
+            sc->had_error = true;
+        }
+    }
+
+    Type *ty = make_type(sc->arena, TY_ARRAY);
+    ty->array.elem = elem;
+    ty->array.count = n->array_lit.count;
+    return ty;
+}
+
+static bool sem_typeswitch_is_exhaustive(Type *subject_ty, ASTNode *n) {
+    if (!n || !subject_ty) return true;
+    if (subject_ty->kind == TY_GENERIC || subject_ty->kind == TY_CONTEXT)
+        return true;
+    if (n->typeswitch.fallback) return true;
+
+    for (int i = 0; i < n->typeswitch.case_count; i++) {
+        Type *mt = n->typeswitch.cases[i]->typecase.match_type;
+        if (!mt) continue;
+        if (mt->kind == TY_INT_GENERIC)
+            mt = resolve_int_type();
+        else if (mt->kind == TY_FLOAT_GENERIC)
+            mt = resolve_float_type();
+        if (types_equal(mt, subject_ty)) return true;
+    }
+    return false;
+}
+
 static Type *sem_normalize_generic_type(Type *ty, const char *generic_name) {
     if (!ty || !generic_name) return ty;
     switch (ty->kind) {
@@ -4657,11 +4706,27 @@ static Type *sem_infer_lvalue(SemCtx *sc, ASTNode *n) {
         }
         case ND_INDEX: {
             Type *arr = sem_infer_expr(sc, n->idx.array);
+            Type *ix  = sem_infer_expr(sc, n->idx.index);
             if (!arr || arr->kind != TY_ARRAY) {
                 lc_error_at(sc->source_path, n->line, 0,
                             "indexing non-array value");
                 sc->had_error = true;
                 return make_type(sc->arena, TY_VOID);
+            }
+            if (!ix || (!sem_is_int_kind(ix->kind) && ix->kind != TY_INT_GENERIC)) {
+                lc_error_at(sc->source_path, n->line, 0,
+                            "array index must be an integer");
+                sc->had_error = true;
+            }
+            if (n->idx.index && n->idx.index->kind == ND_INT_LIT &&
+                arr->array.count >= 0 &&
+                (n->idx.index->int_lit.val < 0 ||
+                 n->idx.index->int_lit.val >= arr->array.count)) {
+                lc_error_at(sc->source_path, n->line, 0,
+                            "array index %lld out of bounds for size %lld",
+                            (long long)n->idx.index->int_lit.val,
+                            (long long)arr->array.count);
+                sc->had_error = true;
             }
             return arr->array.elem;
         }
@@ -4933,6 +4998,10 @@ static Type *sem_infer_expr(SemCtx *sc, ASTNode *n) {
             }
             break;
         }
+        case ND_ARRAY_LIT: {
+            ty = sem_array_literal_type(sc, n);
+            break;
+        }
         case ND_TERNARY: {
             Type *ct = sem_infer_expr(sc, n->ternary.cond);
             if (!ct || (!sem_is_num_kind(ct->kind) && ct->kind != TY_BOOL &&
@@ -5126,12 +5195,29 @@ static void sem_check_stmt(SemCtx *sc, ASTNode *n) {
                 sem_pop(sc);
             }
             break;
-        case ND_TYPESWITCH:
+        case ND_TYPESWITCH: {
+            Type *subject_ty = NULL;
+            const char *subject_name = n->typeswitch.subject_name;
+            if (subject_name && strcmp(subject_name, "#") == 0) {
+                subject_ty = sc->cur_ret;
+            } else if (subject_name) {
+                SemEntry *se = sem_lookup(sc, subject_name);
+                if (se) subject_ty = se->type;
+            }
+
+            if (!sem_typeswitch_is_exhaustive(subject_ty, n)) {
+                lc_error_at(sc->source_path, n->line, 0,
+                            "typeswitch is not exhaustive for subject type %s",
+                            subject_ty ? type_to_llvm(subject_ty) : "(unknown)");
+                sc->had_error = true;
+            }
+
             for (int i = 0; i < n->typeswitch.case_count; i++)
                 sem_check_stmt(sc, n->typeswitch.cases[i]->typecase.body);
             if (n->typeswitch.fallback)
                 sem_check_stmt(sc, n->typeswitch.fallback);
             break;
+        }
         case ND_CRUMBLE:
             break;
         case ND_EXPR_STMT:
@@ -5472,6 +5558,8 @@ static void mangle_type_into(char *buf, size_t cap, Type *t) {
     buf[i] = '\0';
 }
 
+static Type *resolved_expr_type(Codegen *cg, ASTNode *n);
+
 static const char *generic_spec_key(Codegen *cg, ASTNode *fn, Type *actual) {
     char mbuf[256];
     mangle_type_into(mbuf, sizeof(mbuf), actual);
@@ -5480,7 +5568,6 @@ static const char *generic_spec_key(Codegen *cg, ASTNode *fn, Type *actual) {
 
 static Type *find_generic_actual_from_call(Codegen *cg, ASTNode *fd,
                                            ASTNode *call) {
-    (void)cg;
     if (!fd || !fd->func.generic_param || !call) return NULL;
     const char *gname = fd->func.generic_param;
     Type *actual = NULL;
@@ -5503,6 +5590,8 @@ static Type *find_generic_actual_from_call(Codegen *cg, ASTNode *fd,
             hits_generic = true;
         if (hits_generic) {
             Type *argt = call->call.args[i] ? call->call.args[i]->ty : NULL;
+            if (!argt && cg)
+                argt = resolved_expr_type(cg, call->call.args[i]);
             if (argt) {
                 if (argt->kind == TY_INT_GENERIC)
                     argt = resolve_int_type();
@@ -5622,6 +5711,7 @@ static void emit_pending_specializations(Codegen *cg) {
             const char *save_gname = cg->generic_name;
             Type *save_gactual = cg->generic_actual;
             Type *save_ctx = cg->context_actual;
+            const char *save_base = cg->cur_base_func;
             if (sp->generic_name && strcmp(sp->generic_name, "#") == 0) {
                 cg->generic_name = NULL;
                 cg->generic_actual = NULL;
@@ -5630,11 +5720,13 @@ static void emit_pending_specializations(Codegen *cg) {
                 cg->generic_name = sp->generic_name;
                 cg->generic_actual = sp->actual;
             }
+            cg->cur_base_func = sp->fn->func.name;
             EMIT("");
             emit_func(cg, sp->spec);
             cg->generic_name = save_gname;
             cg->generic_actual = save_gactual;
             cg->context_actual = save_ctx;
+            cg->cur_base_func = save_base;
         }
     } while (progress);
 }
@@ -5731,8 +5823,6 @@ static const char *zero_init(Type *t) {
 
 /* ================================================================
    TYPE INFERENCE FOR EXPRESSIONS
-   Returns the LLVM type string for an expression without generating code.
-   Used to emit correct types in call arguments.
    ================================================================ */
 
 static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
@@ -5781,6 +5871,10 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
         case ND_CAST:
             return n->cast.target ? n->cast.target
                                   : make_type(cg->arena, TY_VOID);
+        case ND_INDEX:
+            return n->ty ? n->ty : make_type(cg->arena, TY_VOID);
+        case ND_FIELD:
+            return n->ty ? n->ty : make_type(cg->arena, TY_VOID);
         case ND_CALL: {
             if (n->call.callee->kind == ND_IDENT) {
                 ASTNode *fd = find_func(cg, n->call.callee->ident.name);
@@ -5799,6 +5893,8 @@ static Type *resolved_expr_type(Codegen *cg, ASTNode *n) {
             }
             return make_type(cg->arena, TY_I64);
         }
+        case ND_ARRAY_LIT:
+            return n->ty ? n->ty : make_type(cg->arena, TY_VOID);
         default:
             return make_type(cg->arena, TY_I64);
     }
@@ -5841,10 +5937,14 @@ static const char *expr_llvm_type(Codegen *cg, ASTNode *n) {
             Type *t = resolved_expr_type(cg, n);
             return type_to_llvm(t);
         }
-        case ND_INDEX:
-            return "i64";
-        case ND_FIELD:
-            return "i64";
+        case ND_INDEX: {
+            Type *t = resolved_expr_type(cg, n);
+            return type_to_llvm(t);
+        }
+        case ND_FIELD: {
+            Type *t = resolved_expr_type(cg, n);
+            return type_to_llvm(t);
+        }
         case ND_TERNARY:
             return expr_llvm_type(cg, n->ternary.then_val);
         default:
@@ -5859,6 +5959,60 @@ static const char *expr_llvm_type(Codegen *cg, ASTNode *n) {
 
 static const char *gen_expr(Codegen *cg, ASTNode *n);
 static void gen_stmt(Codegen *cg, ASTNode *n);
+
+static const char *emit_cast(Codegen *cg, const char *val, Type *src_ty,
+                                Type *dst_ty);
+
+static const char *emit_array_index_ptr(Codegen *cg, ASTNode *idx_node,
+                                        const char *arr, const char *idx) {
+    if (!idx_node || !idx_node->idx.array || !idx_node->idx.array->ty ||
+        idx_node->idx.array->ty->kind != TY_ARRAY) {
+        lc_error(idx_node ? idx_node->line : 0, 0,
+                 "array indexing requires a fixed-size array");
+        return "0";
+    }
+
+    Type *arr_ty = idx_node->idx.array->ty;
+    if (arr_ty->array.count < 0) {
+        lc_error(idx_node->line, 0,
+                 "array bounds checking requires a statically sized array");
+        return "0";
+    }
+
+    Type *idx_ty = resolved_expr_type(cg, idx_node->idx.index);
+    const char *idx64 = idx;
+    if (idx_ty && idx_ty->kind != TY_I64) {
+        Type *want = make_type(cg->arena, TY_I64);
+        idx64 = emit_cast(cg, idx, idx_ty, want);
+    }
+
+    int ok_lbl = new_lbl(cg);
+    int fail_lbl = new_lbl(cg);
+
+    int ge = new_tmp(cg);
+    EMITI("%%t%d = icmp sge i64 %s, 0", ge, idx64);
+    int lt = new_tmp(cg);
+    EMITI("%%t%d = icmp slt i64 %s, %lld", lt, idx64,
+          (long long)arr_ty->array.count);
+    int good = new_tmp(cg);
+    EMITI("%%t%d = and i1 %%t%d, %%t%d", good, ge, lt);
+    EMIT_TERM("br i1 %%t%d, label %%%s, label %%%s", good,
+              lbl_name(cg, ok_lbl), lbl_name(cg, fail_lbl));
+
+    EMIT_LABEL(fail_lbl);
+    EMIT_TERM("call void @llvm.trap()");
+    EMIT_TERM("unreachable");
+
+    EMIT_LABEL(ok_lbl);
+    const char *arr_ty_str = type_to_llvm(arr_ty);
+    const char *ety = type_to_llvm(arr_ty->array.elem ? arr_ty->array.elem
+                                                      : make_type(cg->arena, TY_I64));
+    int pt = new_tmp(cg);
+    EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
+          pt, arr_ty_str, arr, idx64);
+    (void)ety;
+    return tmp_name(cg, pt);
+}
 
 static ASTNode *parse_interp_expr(Codegen *cg, const char *src, int line) {
     Lexer *lx = lexer_new(cg->arena, src);
@@ -6319,29 +6473,32 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
         }
 
         case ND_ARRAY_LIT: {
-            Type *elem_ty = NULL;
-            if (n->array_lit.count > 0) {
-                elem_ty = make_type(a, TY_I64);
+            Type *arr_ty = n->ty;
+            if (!arr_ty || arr_ty->kind != TY_ARRAY) {
+                arr_ty = make_type(a, TY_ARRAY);
+                arr_ty->array.elem = make_type(a, TY_I64);
+                arr_ty->array.count = n->array_lit.count;
             }
             int sz = n->array_lit.count;
+            const char *ety = type_to_llvm(arr_ty->array.elem
+                                               ? arr_ty->array.elem
+                                               : make_type(a, TY_I64));
+            const char *arr_ty_str = type_to_llvm(arr_ty);
             int at = new_tmp(cg);
-            const char *ety = elem_ty ? type_to_llvm(elem_ty) : "i64";
-            EMITI("%%t%d = alloca [%d x %s]", at, sz, ety);
+            EMITI("%%t%d = alloca %s", at, arr_ty_str);
             for (int i = 0; i < sz; i++) {
                 const char *val = gen_expr(cg, n->array_lit.elems[i]);
+                Type *src_ty = resolved_expr_type(cg, n->array_lit.elems[i]);
+                val = coerce_value(cg, val, src_ty, arr_ty->array.elem);
                 int pt = new_tmp(cg);
-                EMITI(
-                    "%%t%d = getelementptr inbounds [%d x %s], ptr %%t%d, i64 "
-                    "0, i64 %d",
-                    pt, sz, ety, at, i);
+                EMITI("%%t%d = getelementptr inbounds %s, ptr %%t%d, i64 0, i64 %d",
+                      pt, arr_ty_str, at, i);
                 EMITI("store %s %s, ptr %%t%d", ety, val, pt);
             }
 
             int rt = new_tmp(cg);
-            EMITI(
-                "%%t%d = getelementptr inbounds [%d x %s], ptr %%t%d, i64 0, "
-                "i64 0",
-                rt, sz, ety, at);
+            EMITI("%%t%d = getelementptr inbounds %s, ptr %%t%d, i64 0, i64 0",
+                  rt, arr_ty_str, at);
             return tmp_name(cg, rt);
         }
 
@@ -6538,17 +6695,15 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
             const char *idx = gen_expr(cg, n->idx.index);
 
             Type *arr_ty = n->idx.array->ty;
-            const char *ety = "i64";
-            const char *arr_ty_str = "i64";
-            if (arr_ty && arr_ty->kind == TY_ARRAY) {
-                ety = type_to_llvm(arr_ty->array.elem);
-                arr_ty_str = type_to_llvm(arr_ty);
+            if (!arr_ty || arr_ty->kind != TY_ARRAY) {
+                lc_error(n->line, 0, "array indexing requires an array");
+                return "0";
             }
-            int pt = new_tmp(cg);
-            EMITI("%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
-                  pt, arr_ty_str, arr, idx);
+            const char *ptr = emit_array_index_ptr(cg, n, arr, idx);
+            Type *elem_ty = arr_ty->array.elem ? arr_ty->array.elem
+                                               : make_type(a, TY_I64);
             int rt = new_tmp(cg);
-            EMITI("%%t%d = load %s, ptr %%t%d", rt, ety, pt);
+            EMITI("%%t%d = load %s, ptr %s", rt, type_to_llvm(elem_ty), ptr);
             return tmp_name(cg, rt);
         }
 
@@ -6915,16 +7070,15 @@ static const char *gen_expr(Codegen *cg, ASTNode *n) {
                 const char *arr = gen_expr(cg, n->assign.lhs->idx.array);
                 const char *idx = gen_expr(cg, n->assign.lhs->idx.index);
                 Type *arr_ty = n->assign.lhs->idx.array->ty;
-                const char *arr_ty_str =
-                    arr_ty ? type_to_llvm(arr_ty) : "[0 x i64]";
-                const char *ety2 = arr_ty && arr_ty->kind == TY_ARRAY
-                                       ? type_to_llvm(arr_ty->array.elem)
-                                       : "i64";
-                int pt = new_tmp(cg);
-                EMITI(
-                    "%%t%d = getelementptr inbounds %s, ptr %s, i64 0, i64 %s",
-                    pt, arr_ty_str, arr, idx);
-                EMITI("store %s %s, ptr %%t%d", ety2, rval, pt);
+                if (!arr_ty || arr_ty->kind != TY_ARRAY) {
+                    lc_error(n->line, 0, "array indexing requires an array");
+                    return rval;
+                }
+                const char *pt = emit_array_index_ptr(cg, n->assign.lhs, arr, idx);
+                const char *ety2 = type_to_llvm(arr_ty->array.elem
+                                                ? arr_ty->array.elem
+                                                : make_type(a, TY_I64));
+                EMITI("store %s %s, ptr %s", ety2, rval, pt);
             } else if (n->assign.lhs->kind == ND_FIELD) {
                 ASTNode *obj_node = n->assign.lhs->field.object;
                 const char *fname2 = n->assign.lhs->field.field;
@@ -6998,6 +7152,8 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
             int t = new_tmp(cg);
             const char *alloca_name = tmp_name(cg, t);
             EMITI("%s = alloca %s", alloca_name, llty);
+            EMITI("store %s %s, ptr %s", llty, zero_init(ty), alloca_name);
+            sym_define(cg, n->var.name, ty, alloca_name, false);
 
             if (n->var.init) {
                 if (n->var.init->kind == ND_CALL && ty &&
@@ -7007,11 +7163,7 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 ival = coerce_value(cg, ival,
                                     n->var.init ? n->var.init->ty : NULL, ty);
                 EMITI("store %s %s, ptr %s", llty, ival, alloca_name);
-            } else {
-                EMITI("store %s %s, ptr %s", llty, zero_init(ty), alloca_name);
             }
-
-            sym_define(cg, n->var.name, ty, alloca_name, false);
             break;
         }
 
@@ -7233,8 +7385,18 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                     cg->context_actual ? cg->context_actual : cg->cur_ret;
             } else if (subject_name) {
                 SymEntry *se = sym_lookup(cg, subject_name);
-                if (se) subject_ty = se->type;
+                if (se) {
+                    subject_ty = se->type;
+                } else if (cg->generic_name &&
+                           strcmp(subject_name, cg->generic_name) == 0) {
+                    subject_ty = cg->generic_actual;
+                }
             }
+            if (subject_ty && subject_ty->kind == TY_GENERIC &&
+                cg->generic_actual && subject_ty->generic.param &&
+                cg->generic_name &&
+                strcmp(subject_ty->generic.param, cg->generic_name) == 0)
+                subject_ty = cg->generic_actual;
             if (subject_ty) {
                 if (subject_ty->kind == TY_INT_GENERIC)
                     subject_ty = resolve_int_type();
@@ -7274,14 +7436,66 @@ static void gen_stmt(Codegen *cg, ASTNode *n) {
                 }
                 gen_stmt(cg, tc->typecase.body);
                 scope_pop(cg);
-            } else if (n->typeswitch.fallback) {
-                gen_stmt(cg, n->typeswitch.fallback);
-            } else if (n->typeswitch.case_count > 0) {
-                if (!(subject_ty && (subject_ty->kind == TY_GENERIC ||
-                                     subject_ty->kind == TY_CONTEXT)))
-                    lc_error(
-                        n->line, 0,
-                        "typeswitch has no matching case for current type");
+            } else {
+                ASTNode *ext_match = NULL;
+                if (subject_ty && cg->cur_base_func) {
+                    for (int i = 0; i < cg->in_ext_count; i++) {
+                        ASTNode *ie = cg->in_exts[i];
+                        if (strcmp(ie->in_ext.func_name, cg->cur_base_func) != 0)
+                            continue;
+                        Type *mt = ie->in_ext.tc_type;
+                        if (mt) {
+                            if (mt->kind == TY_INT_GENERIC)
+                                mt = resolve_int_type();
+                            else if (mt->kind == TY_FLOAT_GENERIC)
+                                mt = resolve_float_type();
+                        }
+                        if (mt && types_equal(mt, subject_ty)) {
+                            ext_match = ie;
+                            break;
+                        }
+                    }
+                }
+
+                if (ext_match) {
+                    scope_push(cg);
+                    if (subject_name && strcmp(subject_name, "#") != 0) {
+                        SymEntry *se = sym_lookup(cg, subject_name);
+                        if (se) {
+                            sym_define(cg, subject_name, ext_match->in_ext.tc_type,
+                                       se->llvm_name, se->is_global);
+                            if (ext_match->in_ext.tc_param &&
+                                strcmp(ext_match->in_ext.tc_param, subject_name) != 0)
+                                sym_define(cg, ext_match->in_ext.tc_param,
+                                           ext_match->in_ext.tc_type,
+                                           se->llvm_name, se->is_global);
+                        }
+                    }
+                    gen_stmt(cg, ext_match->in_ext.tc_body);
+                    scope_pop(cg);
+                } else if (n->typeswitch.fallback) {
+                    gen_stmt(cg, n->typeswitch.fallback);
+                } else if (n->typeswitch.case_count > 0) {
+                    if (!(subject_ty && (subject_ty->kind == TY_GENERIC ||
+                                         subject_ty->kind == TY_CONTEXT))) {
+                        int col  = source_first_content_col_at(n->source_path,
+                                                                n->line);
+                        int tlen = source_content_len_at(n->source_path,
+                                                         n->line);
+                        const char *ty_label = subject_ty
+                            ? type_to_llvm(subject_ty)
+                            : "(unknown)";
+                        lc_error_tok_at(
+                            n->source_path, n->line, col, tlen,
+                            "typeswitch: no matching typecase for '%s' (type "
+                            "'%s') in '%s', add typecase(%s) or a fallback {} "
+                            "block",
+                            subject_name ? subject_name : "?",
+                            ty_label,
+                            cg->cur_base_func ? cg->cur_base_func : "?",
+                            ty_label);
+                    }
+                }
             }
             break;
         }
@@ -7353,6 +7567,31 @@ static void emit_enum_types(Codegen *cg) {
     }
 }
 
+static void emit_const_val(Codegen *cg, ASTNode *val, Type *want_ty) {
+    if (!val) { fprintf(cg->out, "%s", zero_init(want_ty)); return; }
+    switch (val->kind) {
+        case ND_INT_LIT:
+            fprintf(cg->out, "%lld", (long long)val->int_lit.val);
+            break;
+        case ND_FLOAT_LIT: {
+            double d = val->float_lit.val;
+            uint64_t bits;
+            memcpy(&bits, &d, sizeof bits);
+            fprintf(cg->out, "0x%016llX", (unsigned long long)bits);
+            break;
+        }
+        case ND_BOOL_LIT:
+            fprintf(cg->out, "%d", val->bool_lit.val ? 1 : 0);
+            break;
+        case ND_CHAR_LIT:
+            fprintf(cg->out, "%d", (unsigned char)val->char_lit.val);
+            break;
+        default:
+            fprintf(cg->out, "%s", zero_init(want_ty));
+            break;
+    }
+}
+
 static void emit_globals(Codegen *cg) {
     for (int i = 0; i < cg->program->program.count; i++) {
         ASTNode *item = cg->program->program.items[i];
@@ -7366,9 +7605,47 @@ static void emit_globals(Codegen *cg) {
         if (item->var.init && item->var.init->kind == ND_INT_LIT) {
             fprintf(cg->out, "%s = global %s %lld\n", gname, llty,
                     (long long)item->var.init->int_lit.val);
+        } else if (item->var.init && item->var.init->kind == ND_FLOAT_LIT) {
+            fprintf(cg->out, "%s = global %s ", gname, llty);
+            emit_const_val(cg, item->var.init, ty);
+            fprintf(cg->out, "\n");
         } else if (item->var.init && item->var.init->kind == ND_BOOL_LIT) {
             fprintf(cg->out, "%s = global %s %d\n", gname, llty,
                     item->var.init->bool_lit.val ? 1 : 0);
+        } else if (item->var.init && item->var.init->kind == ND_STRUCT_INIT) {
+            ASTNode *init = item->var.init;
+            ASTNode *sd   = find_struct(cg, init->struct_init.struct_name);
+            bool packed   = sd && sd->strct.packed;
+
+            fprintf(cg->out, "%s = global %s %s{", gname, llty,
+                    packed ? "<" : "");
+
+            int nfields = sd ? sd->strct.field_count
+                             : init->struct_init.field_count;
+            for (int fi = 0; fi < nfields; fi++) {
+                if (fi) fprintf(cg->out, ", ");
+
+                const char *decl_fname = sd
+                    ? sd->strct.field_names[fi]
+                    : init->struct_init.field_names[fi];
+                Type *decl_fty = (sd && fi < sd->strct.field_count)
+                    ? sd->strct.field_types[fi]
+                    : make_type(cg->arena, TY_I64);
+                const char *fllty = type_to_llvm(decl_fty);
+
+                ASTNode *fval = NULL;
+                for (int k = 0; k < init->struct_init.field_count; k++) {
+                    if (strcmp(init->struct_init.field_names[k],
+                               decl_fname) == 0) {
+                        fval = init->struct_init.field_vals[k];
+                        break;
+                    }
+                }
+
+                fprintf(cg->out, "%s ", fllty);
+                emit_const_val(cg, fval, decl_fty);
+            }
+            fprintf(cg->out, "}%s\n", packed ? ">" : "");
         } else if (item->var.init && item->var.init->kind == ND_STRING_LIT) {
             const char *s = item->var.init->str_lit.val;
             int slen = (int)strlen(s) + 1;
@@ -7421,7 +7698,9 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
     const char *save_generic_name = cg->generic_name;
     Type *save_generic_actual = cg->generic_actual;
     Type *save_context_actual = cg->context_actual;
+    const char *save_base_func = cg->cur_base_func;
     cg->cur_func = fname;
+    if (!cg->cur_base_func) cg->cur_base_func = fname;
     cg->cur_ret = ret_ty;
     cg->ret_emitted = false;
 
@@ -7452,6 +7731,7 @@ static void emit_func(Codegen *cg, ASTNode *fn) {
     cg->generic_name = save_generic_name;
     cg->generic_actual = save_generic_actual;
     cg->context_actual = save_context_actual;
+    cg->cur_base_func = save_base_func;
     EMIT("}");
 }
 
@@ -7566,6 +7846,7 @@ void codegen_run(FILE *out, ASTNode *program, Arena *a) {
     emit_enum_types(cg);
 
     EMIT("declare i32 @sprintf(ptr, ptr, ...)");
+    EMIT("declare void @llvm.trap()");
     for (int i = 0; i < cg->program->program.count; i++) {
         ASTNode *item = cg->program->program.items[i];
         if (item->kind == ND_EXTERN_DECL) emit_extern(cg, item);
@@ -7582,6 +7863,7 @@ void codegen_run(FILE *out, ASTNode *program, Arena *a) {
             continue;
         if (strcmp(item->func.name, "main") == 0) has_main = true;
         EMIT("");
+        cg->cur_base_func = NULL;
         emit_func(cg, item);
     }
 
