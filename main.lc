@@ -1,0 +1,28 @@
+@tdl="e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+
+import C_std;
+extern puts(str s) void;
+
+main() i32 {
+    i64 g = 10;
+    str t = "bhumi: ";
+    str tre = tostring(690);
+    str f = input("what is your name?: ");
+    i64 age = input("what is your age?: ");
+    puts("{t} hello {f} you are {age} years old.");
+    Color red = Color { r(255); g(50); b(255); a(128); }
+}
+
+struct Rectangle {
+    f32 x;
+    f32 y;
+    f32 width;
+    f32 height;
+}
+
+packed struct Color {
+    u8 r;
+    u8 g;
+    u8 b;
+    u8 a;
+}
