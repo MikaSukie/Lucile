@@ -6781,7 +6781,7 @@ static void emit_extern(Codegen *cg, ASTNode *fn) {
 }
 
 /* ================================================================
-   COLLECT PASS — gather all top-level declarations
+   COLLECT PASS, gather all top-level declarations
    ================================================================ */
 
 static void collect_decls(Codegen *cg) {
