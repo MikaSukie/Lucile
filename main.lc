@@ -1,5 +1,6 @@
 @tdl="e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
 @ttriple="x86_64-pc-linux-gnu";
+// @cwarn; // crumb checker is ignored as a warning.
 
 import C_std;
 extern puts(str s) void;
@@ -21,6 +22,28 @@ main() i32 {
 
     i8 tr = 9;
     puts("{tostring(tr)}");
+
+    // enum testing
+    Exist<string> thepath = Exist->Some(input("file path?: "));
+    match (thepath) {
+        Some(contents) {
+            puts("path is: " + contents);
+        }
+        None {
+            puts("Null err");
+        }
+    }
+    Respond<string, string> infile = try_read_file(thepath);
+    match (infile) {
+        Ok(contents) {
+            puts(contents);
+        }
+        Err(e) {
+            puts(e);
+        }
+    }
+
+
     dropall(t, f);
 }
 
