@@ -2,6 +2,8 @@
 @ttriple="x86_64-pc-linux-gnu";
 // @cwarn; // crumb checker is ignored as a warning.
 
+/* THIS IS NOT A SAFE RUNNING EXAMPLE. I NEED TO TEST THE NEW CRUMB SYSTEM TO CONFIRM NO LEAKS HAPPEN. */
+
 import C_std;
 extern puts(str s) void;
 
