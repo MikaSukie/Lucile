@@ -800,3 +800,45 @@ This system guarantees:
 ## 16.8 Design Principle
 
 Mutation resets the validity of all prior observations. Only the mutator defines the next valid readable state.
+
+## 17.0 Extern Function Parameter Mutability
+
+Extern functions are assumed to mutate all arguments unless a parameter is marked `nomd`.
+
+Used as:
+
+```
+extern foo(x) void;
+```
+
+This behaves like:
+
+- `extern foo(x) void;` may mutate `x`
+- call-sites must assume it invalidates all readers of `x`
+
+But since `nomd` means non mutable, it can also mean the extern does NOT mutate the arg.
+
+Used as:
+
+```
+extern foo(nomd x) void;
+```
+
+This means:
+
+- `x` is guaranteed not to be mutated by the extern
+- readers of `x` are not invalidated by this call
+
+Mixed parameters must be supported:
+
+```
+extern foo(nomd x, y, nomd z) void;
+```
+
+Meaning:
+
+- `x` does NOT mutate
+- `y` may mutate
+- `z` does NOT mutate
+
+`nomd` on extern parameters is a contract and must be respected by the compiler's call-site invalidation rules.
