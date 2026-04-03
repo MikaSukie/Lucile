@@ -1,8 +1,0 @@
-package_name = main
-# extra_clang_flags = -Wno-override-module
-bhumi_sources = main.lc
-bhumi_binary = ./lucile
-c_sources = stdlib.c
-optimize = true
-opt_level = O2
-autorun = true
