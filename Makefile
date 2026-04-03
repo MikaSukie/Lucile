@@ -1,29 +1,37 @@
-CC      := clang
-CFLAGS  := -std=c17 -Wall -Wextra -O2
-LDFLAGS :=
+CXX      := clang++
+CXXFLAGS := -std=c++23 -O2 -Wall -Wextra -Wpedantic -fcolor-diagnostics
+LDFLAGS  :=
 
-SRCS    := lucile.c
-OBJS    := $(SRCS:.c=.o)
-TARGET  := lucile
+# Debug build: make DEBUG=1
+ifdef DEBUG
+  CXXFLAGS += -g -O0 -fsanitize=address,undefined -DDEBUG
+  LDFLAGS  += -fsanitize=address,undefined
+endif
+
+SRCDIR := src
+SRCS   := $(SRCDIR)/lexer.cpp     \
+           $(SRCDIR)/parser.cpp    \
+           $(SRCDIR)/types.cpp     \
+           $(SRCDIR)/sema.cpp      \
+           $(SRCDIR)/codegen.cpp   \
+           $(SRCDIR)/codegen2.cpp  \
+           $(SRCDIR)/main.cpp
+
+TARGET := lucilec
+
+.PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDFLAGS)
+	@echo "Built: $@"
 
-%.o: %.c lucile.h
-	$(CC) $(CFLAGS) -c $< -o $@
+# Run the bundled test suite
+test: all
+	@echo "=== Running tests ==="
+	@$(MAKE) -C tests run COMPILER=../$(TARGET) --no-print-directory
 
 clean:
-	rm -f $(OBJS) $(TARGET) *.ll
-
-run: $(TARGET)
-	./$(TARGET)
-
-debug: CFLAGS += -g -O0
-debug: clean $(TARGET)
-
-release: CFLAGS += -O3 -DNDEBUG
-release: clean $(TARGET)
-
-.PHONY: all clean run debug release
+	rm -f $(TARGET)
+	rm -f tests/*.ll tests/*.out
