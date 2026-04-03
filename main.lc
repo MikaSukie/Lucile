@@ -1,70 +1,87 @@
 @tdl="e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
 @ttriple="x86_64-pc-linux-gnu";
-// @cwarn; // crumb checker is ignored as a warning.
 
-/* THIS IS NOT A SAFE RUNNING EXAMPLE. I NEED TO TEST THE NEW CRUMB SYSTEM TO CONFIRM NO LEAKS HAPPEN. */
-
-import C_std;
-extern puts(str s) void;
-
-nomd i32 d = 64;
+extern printf(str fmt,) void;
 
 main() i32 {
-    nomd i32 z = 7;
-    i64 g = 10;
-    crumble(g)!r=0!w=0;
-    str t = "bhumi: ";
-    t = "test";
-    str f = input("what is your name?: ");
-    f = t;
-    i64 age = input("what is your age?: ");
-    puts("\{t\} hello {f} you are {age} years old.");
+    i32 f = 8;
+    f = f + f;
+    f += f;
+    printf("hello %d %d %d\n", f, f, f);
+    Exist<str> stro = Exist->Some(input("file path?: "));
+    print(unwrap_exist(stro) + "\n");
+    print(unwrap_res_to_str(try_read_file(stro)) + "\n");
+    f32 g = 0.0;
+}
 
-    bool yes = !!!!!yes;
+extern exit(i32 code) void;
 
-    i8 tr = 9;
-    puts("{tostring(tr)}");
+panic(str reason) void {
+    print("Panicked because: " + reason + "\n");
+    exit(1);
+}
 
-    // enum testing
-    Exist<string> thepath = Exist->Some(input("file path?: "));
-    match (thepath) {
-        Some(contents) {
-            puts("path is: " + contents);
+unwrap_exist(Exist<str> s) str {
+    match (s) {
+        Some(t) {
+            return t;
         }
         None {
-            puts("Null err");
+            panic("Nothing Inputted");
         }
     }
-    Respond<string, string> infile = try_read_file(thepath);
-    match (infile) {
-        Ok(contents) {
-            puts(contents);
+}
+
+unwrap_res_to_str(Respond<str, str> s) str {
+    match (s) {
+        Ok(d) {
+            return d;
         }
         Err(e) {
-            puts(e);
+            panic(e);
         }
     }
-
-
-    dropall(t, f);
 }
 
-struct Rectangle {
-    f32 x;
-    f32 y;
-    f32 width;
-    f32 height;
+extern print(str s) void;
+extern read_file(str path) str;
+extern file_exists(str path) bool;
+
+enum Exist<T> {
+  None;
+  Some(T);
 }
 
-packed struct Color {
-    u8 r;
-    u8 g;
-    u8 b;
-    u8 a;
+enum Respond<T, E> { 
+    Ok(T);
+    Err(E);
 }
 
-in tostring {
-    typecase(i8) for (candidate) {
-        return i8tostr(candidate);
+try_read_file(Exist<str> path) Respond<str, str> {
+    match (path) {
+        Some(p) {
+            if (file_exists(p)) {
+                return Respond->Ok(read_file(p));
+            } else {
+                return Respond->Err("Error reading file");
+            }
+        }
+        None {
+            return Respond->Err("No path given");
+        }
+    }
+}
+
+extern sinput(str input) str;
+extern iinput(str input) i32;
+extern binput(str input) bool;
+extern finput(str input) f64;
+
+input(str s) # {
+    typeswitch(#) {
+        typecase(i32)  { return iinput(s); }
+        typecase(f64)  { return finput(s); }
+        typecase(bool) { return binput(s); }
+        typecase(str)  { return sinput(s); }
     }
 }
